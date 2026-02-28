@@ -93,7 +93,7 @@ newOracleEnv = do
   where
     mkEnv k = OracleEnv
       { oeApiKey  = k
-      , oeModel   = "google/gemini-flash-1.5-8b"
+      , oeModel   = "google/gemini-2.5-flash-lite"
       , oeBaseUrl = "https://openrouter.ai/api/v1"
       }
 

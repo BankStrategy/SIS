@@ -309,6 +309,9 @@ runSelfModCycle cfg = do
                         ("Mutation inapplicable: " <> applyErr)
           emit cfg step3
           archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+          -- Blacklist inapplicable mutations too so they are not re-proposed.
+          atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+            (Set.insert (fp, hmDescription mut))
           pure [step1, step2, step3]
 
         Right mutModule -> do
@@ -325,7 +328,7 @@ runSelfModCycle cfg = do
 
           -- ── Steps 4-5: Write + LH + SBV + cabal test (transactional) ─────
           nowPosix <- getPOSIXTime
-          let now    = round nowPosix :: Int64
+          let now    = floor nowPosix :: Int64
               opName = "write:" <> T.pack fp
               proof  = mockQuorumProof opName now
 

@@ -44,7 +44,7 @@ main = do
   genNum <- readGeneration
 
   putStrLn banner
-  putStrLn "Oracle: google/gemini-flash-1.5-8b | LH: enabled | SBV: z3-4.15.5"
+  putStrLn "Oracle: google/gemini-2.5-flash-lite | LH: enabled | SBV: z3-4.15.5"
   when (genNum > 0) $
     putStrLn ("Generation: " <> show genNum <> "\n")
 
