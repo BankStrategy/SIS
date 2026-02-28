@@ -28,12 +28,19 @@ module DGM.HsAST
   , HsRewriteRule
   , HsRuleSet
   , defaultHsRules
+    -- * Individual rules
+  , addHaddockRule
+  , addHaddockTransform
+  , addTypeAnnotationRule
+  , addTypeAnnotationTransform
+  , limitedEtaReduceRule
+  , limitedEtaReduceTransform
   ) where
 
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Char (isAlphaNum, isLower)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 
 #ifdef WITH_EXACTPRINT
 import qualified Language.Haskell.GHC.ExactPrint as EP
@@ -203,7 +210,12 @@ collectHsMutations rules m =
 -- because text-level word-splitting cannot preserve multi-equation definitions,
 -- guards, or operator sections — it produces incorrect code.
 defaultHsRules :: HsRuleSet
-defaultHsRules = [unusedImportRule]
+defaultHsRules =
+  [ unusedImportRule
+  , addHaddockRule
+  , addTypeAnnotationRule
+  , limitedEtaReduceRule
+  ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule: eta-reduction
@@ -357,6 +369,142 @@ isSimpleVar t
   | otherwise = isLower (T.head t)
                 && T.all (\c -> isAlphaNum c || c == '_' || c == '\'') t
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rule: add Haddock stub
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Rule: insert a @-- | TODO@ Haddock comment above the first undocumented
+-- top-level binding.
+addHaddockRule :: HsMutation
+addHaddockRule = HsMutation
+  { hmDescription = "add-haddock-stub"
+  , hmTransform   = addHaddockTransform
+  }
+
+addHaddockTransform :: Text -> Either Text Text
+addHaddockTransform src =
+  let ls = T.lines src
+      idx = findFirstUndocumented ls
+  in  case idx of
+        Nothing -> Left "no undocumented top-level bindings found"
+        Just i  ->
+          let before = take i ls
+              after  = drop i ls
+              stub   = "-- | TODO: document this function"
+          in  Right (T.unlines (before ++ [stub] ++ after))
+  where
+    -- Find index of first line that looks like a top-level binding
+    -- and is NOT preceded by a "-- |" comment line.
+    findFirstUndocumented :: [Text] -> Maybe Int
+    findFirstUndocumented lns =
+      let indexed = zip [0..] lns
+          isBinding (_, l) =
+            let s = T.stripStart l
+            in  T.length s > 2
+             && not (T.null s)
+             && isLower (T.head s)
+             && (T.isInfixOf " = " s || T.isInfixOf " :: " s)
+          isHaddock l = "-- |" `T.isPrefixOf` T.stripStart l
+          prevLine i = if i == 0 then "" else lns !! (i - 1)
+      in  fmap fst $
+          listToMaybe $
+          filter (\(i, l) -> isBinding (i, l) && not (isHaddock (prevLine i))) indexed
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rule: add type annotation stub
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Rule: insert a @{- name :: _TODO_ -}@ comment above the first top-level
+-- binding that lacks a type signature on the preceding line.
+addTypeAnnotationRule :: HsMutation
+addTypeAnnotationRule = HsMutation
+  { hmDescription = "add-type-annotation-stub"
+  , hmTransform   = addTypeAnnotationTransform
+  }
+
+addTypeAnnotationTransform :: Text -> Either Text Text
+addTypeAnnotationTransform src =
+  let ls  = T.lines src
+      idx = findFirstUntyped ls
+  in  case idx of
+        Nothing -> Left "no unannotated top-level bindings found"
+        Just i  ->
+          let before = take i ls
+              after  = drop i ls
+              -- Extract the function name from the binding line
+              fname  = T.takeWhile (\c -> c /= ' ' && c /= '\t') (T.stripStart (ls !! i))
+              stub   = "{- " <> fname <> " :: _TODO_ -}"
+          in  Right (T.unlines (before ++ [stub] ++ after))
+  where
+    findFirstUntyped :: [Text] -> Maybe Int
+    findFirstUntyped lns =
+      let indexed = zip [0..] lns
+          isValueBinding (_, l) =
+            let s = T.stripStart l
+            in  not (T.null s)
+             && isLower (T.head s)
+             && " = " `T.isInfixOf` s
+             && not ("::" `T.isInfixOf` s)
+          prevLine i = if i == 0 then "" else lns !! (i - 1)
+          hasTypeSig i = "::" `T.isInfixOf` prevLine i
+      in  fmap fst $
+          listToMaybe $
+          filter (\(i, l) -> isValueBinding (i, l) && not (hasTypeSig i)) indexed
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rule: limited eta-reduce (single-equation only)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Safer version of eta-reduction that only fires on single-equation,
+-- single-argument, single-line definitions of the form @f x = g x@.
+limitedEtaReduceRule :: HsMutation
+limitedEtaReduceRule = HsMutation
+  { hmDescription = "eta-reduce-single-eq"
+  , hmTransform   = limitedEtaReduceTransform
+  }
+
+limitedEtaReduceTransform :: Text -> Either Text Text
+limitedEtaReduceTransform src =
+  let ls   = T.lines src
+      mIdx = findEtaCandidate ls
+  in  case mIdx of
+        Nothing        -> Left "no eta-reducible single-equation bindings found"
+        Just (i, reduced) ->
+          Right (T.unlines (take i ls ++ [reduced] ++ drop (i+1) ls))
+  where
+    -- Find a line of the form "f x = g x" where the line fits the pattern:
+    -- exactly "name arg = expr arg"
+    findEtaCandidate :: [Text] -> Maybe (Int, Text)
+    findEtaCandidate lns =
+      listToMaybe [ (i, reduced)
+                  | (i, l) <- zip [0..] lns
+                  , Just reduced <- [tryEtaReduce l]
+                  ]
+
+    tryEtaReduce :: Text -> Maybe Text
+    tryEtaReduce line =
+      -- Pattern: "fname arg = expr arg"  where arg is the last word on both sides
+      let ws = T.words line
+      in  case ws of
+            (fname : args)
+              | not (T.null fname)
+              , isLower (T.head fname)
+              , length args >= 3                  -- at least: arg = expr arg
+              , last ws == last (init ws)         -- last arg on LHS == last arg on RHS
+              , "=" `elem` ws                     -- has = sign
+              ->
+                  let eqIdx = length (takeWhile (/= "=") ws)
+                      lhsArgs = take (eqIdx - 1) (tail ws)  -- args before =
+                      lastArg = last lhsArgs
+                      rhs     = drop (eqIdx + 1) ws
+                  in  if not (null lhsArgs)
+                       && not (null rhs)
+                       && last rhs == lastArg
+                       && length lhsArgs == 1  -- single argument only
+                       then Just (T.unwords (fname : init lhsArgs ++ ["="] ++ init rhs))
+                       else Nothing
+            _ -> Nothing
+
 #else
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Stub (with-exactprint flag absent)
@@ -415,6 +563,30 @@ collectHsMutations _ _ = []
 -- | Empty rule set — exactprint disabled.
 defaultHsRules :: HsRuleSet
 defaultHsRules = []
+
+-- | Stub — always Left.
+addHaddockRule :: HsMutation
+addHaddockRule = HsMutation "add-haddock-stub" addHaddockTransform
+
+-- | Stub — always Left.
+addHaddockTransform :: Text -> Either Text Text
+addHaddockTransform _ = Left stubMsg
+
+-- | Stub — always Left.
+addTypeAnnotationRule :: HsMutation
+addTypeAnnotationRule = HsMutation "add-type-annotation-stub" addTypeAnnotationTransform
+
+-- | Stub — always Left.
+addTypeAnnotationTransform :: Text -> Either Text Text
+addTypeAnnotationTransform _ = Left stubMsg
+
+-- | Stub — always Left.
+limitedEtaReduceRule :: HsMutation
+limitedEtaReduceRule = HsMutation "eta-reduce-single-eq" limitedEtaReduceTransform
+
+-- | Stub — always Left.
+limitedEtaReduceTransform :: Text -> Either Text Text
+limitedEtaReduceTransform _ = Left stubMsg
 
 stubMsg :: Text
 stubMsg = "ghc-exactprint backend not enabled; build with -f+with-exactprint"

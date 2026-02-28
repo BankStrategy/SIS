@@ -765,6 +765,48 @@ hsASTTests = testGroup "DGM.HsAST"
       case parseResult of
         Left err -> assertFailure ("parseHsText failed: " <> T.unpack err)
         Right m  -> length (hsNodes m) >= 1 @?= True
+
+  -- ── addHaddockRule ─────────────────────────────────────────────────────────
+
+  , testCase "addHaddockTransform inserts stub before undocumented binding" $ do
+      let src = "module Foo where\n\nfoo x = x + 1\n"
+      case addHaddockTransform src of
+        Left err  -> assertFailure ("should have found undocumented binding: " <> T.unpack err)
+        Right out -> T.isInfixOf "-- | TODO" out @?= True
+
+  , testCase "addHaddockTransform skips already-documented bindings" $ do
+      let src = "module Foo where\n\n-- | Documented\nfoo x = x\n"
+      case addHaddockTransform src of
+        Left _  -> pure ()  -- expected: no undocumented bindings
+        Right _ -> assertFailure "should not fire when all bindings are documented"
+
+  -- ── addTypeAnnotationRule ──────────────────────────────────────────────────
+
+  , testCase "addTypeAnnotationTransform inserts stub for unannotated binding" $ do
+      let src = "module Foo where\n\nfoo x = x + 1\n"
+      case addTypeAnnotationTransform src of
+        Left err  -> assertFailure ("should have found unannotated binding: " <> T.unpack err)
+        Right out -> T.isInfixOf "_TODO_" out @?= True
+
+  , testCase "addTypeAnnotationTransform skips annotated bindings" $ do
+      let src = "module Foo where\n\nfoo :: Int -> Int\nfoo x = x + 1\n"
+      case addTypeAnnotationTransform src of
+        Left _  -> pure ()  -- expected: all bindings have signatures
+        Right _ -> assertFailure "should not fire when all bindings have type signatures"
+
+  -- ── limitedEtaReduceRule ───────────────────────────────────────────────────
+
+  , testCase "limitedEtaReduceTransform reduces f x = g x" $ do
+      let src = "module Foo where\n\nfoo x = bar x\n"
+      case limitedEtaReduceTransform src of
+        Left err  -> assertFailure ("should have found eta candidate: " <> T.unpack err)
+        Right out -> T.isInfixOf "foo = bar" out @?= True
+
+  , testCase "limitedEtaReduceTransform does not fire on multi-arg bindings" $ do
+      let src = "module Foo where\n\nfoo x y = bar x y\n"
+      case limitedEtaReduceTransform src of
+        Left _  -> pure ()  -- expected: multi-arg not handled
+        Right _ -> assertFailure "should not fire on multi-argument bindings"
   ]
 
 -- | Drop trailing newline characters for lenient round-trip comparison.
