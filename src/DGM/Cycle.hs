@@ -60,11 +60,11 @@ import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flu
 import DGM.SafetyKernel
 import qualified DGM.Archive as Archive
 
-import DGM.HsAST (HsMutation(..), applyHsMutation)
+import DGM.HsAST (HsMutation(..), applyHsMutation, printHsModule)
 import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation)
 import DGM.Liquid (verifyWithLiquid, LiquidResult(..))
 import DGM.SelfCompile
-  ( testSelf, scoreCompileResult
+  ( testSelf, scoreCompileResult, enrichScore
   , SelfModTxn(..), withSelfModTxn
   )
 import DGM.ModGraph (buildModuleGraph, removesExportedName)
@@ -317,7 +317,9 @@ runSelfModCycle cfg = do
 
         Right mutModule -> do
           origText <- TIO.readFile fp
-          let txn = SelfModTxn
+          let origLen = T.length origText
+              mutLen  = T.length (printHsModule mutModule)
+              txn = SelfModTxn
                       { smtFile         = fp
                       , smtOriginalText = origText
                       , smtMutation     = mut
@@ -386,7 +388,8 @@ runSelfModCycle cfg = do
                         return (Left ("SBV timeout: " <> msg))
                       Verified _ -> do
                         cr <- testSelf
-                        let sc = scoreCompileResult cr
+                        let base = scoreCompileResult cr
+                            sc   = enrichScore base origLen mutLen (Just lhText)
                         writeIORef scoreRef sc
                         if sc >= 1.0
                           then return (Right ())
