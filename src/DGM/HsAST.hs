@@ -300,7 +300,9 @@ unusedImportTransform src =
       case extractExplicitNames line of
         Nothing    -> False  -- not an explicit import
         Just []    -> False  -- empty list — keep for side effects
-        Just names -> all (\n -> not (n `T.isInfixOf` body)) names
+        Just names -> all (\n ->
+          let base = T.strip (T.takeWhile (/= '(') n)
+          in  T.null base || not (base `T.isInfixOf` body)) names
 
     -- | Extract the names from @import M (f, g, ...)@.
     -- Returns @Nothing@ for qualified / hiding / wildcard imports.
