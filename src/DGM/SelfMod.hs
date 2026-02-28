@@ -53,7 +53,7 @@ import DGM.Types
 import DGM.HsAST
 import DGM.SafetyKernel
 import DGM.ModGraph (ModuleGraph, moduleImpact)
-import DGM.Oracle (newOracleEnv)
+import DGM.Oracle (newOracleEnv, MutationContext)
 import DGM.OracleHandle (withOracle, proposeMutationH)
 import DGM.Reversal (Invertible(..), TypedTxn(..))
 
@@ -110,8 +110,9 @@ readOwnSource fp = do
 proposeSelfMutations
   :: AgentState
   -> [FilePath]
+  -> Maybe MutationContext  -- ^ Archive context to guide the oracle.
   -> IO [(FilePath, HsMutation, HsModule)]
-proposeSelfMutations st fps = do
+proposeSelfMutations st fps mCtx = do
   blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
   perFile    <- mapConcurrently (\fp -> do
@@ -128,7 +129,7 @@ proposeSelfMutations st fps = do
           Just env -> do
             let src   = printHsModule m
                 tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
-            eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests
+            eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
             case eOrMut of
               Left err -> do
                 unless ("build with -f+with-oracle" `T.isInfixOf` err) $

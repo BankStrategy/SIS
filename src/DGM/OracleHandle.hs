@@ -38,7 +38,7 @@ module DGM.OracleHandle
 import Data.Text (Text)
 
 import DGM.HsAST (HsMutation)
-import DGM.Oracle (OracleEnv, proposeMutation, scoreAndRankMutations)
+import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, scoreAndRankMutations)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Capability token
@@ -87,9 +87,10 @@ withOracle env f = f (OracleHandle_ env)
 -- from the handle.
 proposeMutationH
   :: OracleHandle
-  -> FilePath    -- ^ Target source file (relative to repo root).
-  -> Text        -- ^ Full module source text.
-  -> [Text]      -- ^ Test function names present in the module.
+  -> FilePath              -- ^ Target source file (relative to repo root).
+  -> Text                  -- ^ Full module source text.
+  -> [Text]                -- ^ Test function names present in the module.
+  -> Maybe MutationContext -- ^ Optional archive feedback for guided mutation.
   -> IO (Either Text HsMutation)
 proposeMutationH (OracleHandle_ env) = proposeMutation env
 

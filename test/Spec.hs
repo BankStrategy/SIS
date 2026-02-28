@@ -1247,7 +1247,7 @@ modGraphTests = testGroup "DGM.ModGraph"
       fps  <- discoverSources
       mg   <- buildModuleGraph fps
       node <- newAgentState (ASTNode "n" ModuleNode [] Nothing)
-      candidates <- proposeSelfMutations node fps
+      candidates <- proposeSelfMutations node fps Nothing
       let ranked = rankMutations mg candidates
       length ranked @?= length candidates
 
@@ -1643,7 +1643,7 @@ oracleTests = testGroup "DGM.Oracle"
             , oeBaseUrl = "https://example.invalid"
             }
       -- Should not throw; may return Left (stub) or Left (network error)
-      result <- proposeMutation env "src/DGM/Foo.hs" "module Foo where" []
+      result <- proposeMutation env "src/DGM/Foo.hs" "module Foo where" [] Nothing
       case result of
         Left  _ -> return ()   -- expected in test environment (no real key)
         Right _ -> return ()   -- also OK if oracle happened to respond
@@ -1685,7 +1685,7 @@ oracleTests = testGroup "DGM.Oracle"
       st  <- newAgentState node
       fps <- discoverSources
       -- If no oracle key is present, falls back gracefully to heuristics.
-      candidates <- proposeSelfMutations st fps
+      candidates <- proposeSelfMutations st fps Nothing
       -- Result is a list (possibly empty); no exception should be thrown.
       length candidates >= 0 @?= True
   ]
@@ -1715,7 +1715,7 @@ oracleHandleTests = testGroup "DGM.OracleHandle"
             , oeBaseUrl = "https://example.com"
             }
       result <- withOracle env $ \h ->
-        proposeMutationH h "src/DGM/Foo.hs" "module Foo where" []
+        proposeMutationH h "src/DGM/Foo.hs" "module Foo where" [] Nothing
       case result of
         Left _  -> return ()   -- expected: stub returns Left
         Right _ -> assertFailure "stub should return Left"

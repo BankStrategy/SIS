@@ -22,6 +22,7 @@ module DGM
   , module DGM.Oracle
   , module DGM.OracleHandle
   , module DGM.NatLang
+  , module DGM.RuleMiner
   ) where
 
 import DGM.Types
@@ -43,3 +44,4 @@ import DGM.Reversal
 import DGM.Oracle
 import DGM.OracleHandle
 import DGM.NatLang
+import DGM.RuleMiner

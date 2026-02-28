@@ -31,6 +31,7 @@ module DGM.Oracle
   , newOracleEnv
     -- * Proposal
   , proposeMutation
+  , MutationContext(..)
     -- * Scoring
   , scoreAndRankMutations
     -- * Health
@@ -48,6 +49,15 @@ import Control.Exception (try, SomeException)
 import Data.Maybe (mapMaybe)
 
 import DGM.HsAST (HsMutation(..))
+
+-- | Context from the archive to guide the oracle toward high-value mutations.
+data MutationContext = MutationContext
+  { mcBestScore       :: Double     -- ^ Best score achieved so far.
+  , mcTotalEntries    :: Int        -- ^ Total archive entries.
+  , mcPassRate        :: Double     -- ^ Fraction of mutations that passed tests.
+  , mcRecentSuccesses :: [Text]     -- ^ Last 3 successful mutation descriptions.
+  , mcEvolutionGoal   :: Maybe Text -- ^ Natural-language goal if set.
+  } deriving (Show, Eq)
 
 #ifdef WITH_ORACLE
 import Control.Monad (foldM)
@@ -141,13 +151,15 @@ oracleSystemPrompt :: Text
 oracleSystemPrompt =
   "You are a mutation oracle for DGM, a self-improving Haskell system. " <>
   "Propose exactly ONE small, safe improvement to the given Haskell module " <>
-  "as a unified diff. Output ONLY the diff, starting with --- lines and " <>
-  "ending after the last +++ block. Do not include any explanation or " <>
-  "markdown fences."
+  "as a unified diff. Valued improvements include: removing unused imports, " <>
+  "simplifying expressions, adding type signatures, improving documentation, " <>
+  "reducing code duplication, and eliminating dead code. " <>
+  "Output ONLY the diff, starting with --- lines and ending after the last " <>
+  "+++ block. Do not include any explanation or markdown fences."
 
 -- | Build the user-role prompt for a mutation request.
-buildMutationPrompt :: FilePath -> Text -> [Text] -> Text
-buildMutationPrompt fp src tests =
+buildMutationPrompt :: FilePath -> Text -> [Text] -> Maybe MutationContext -> Text
+buildMutationPrompt fp src tests mCtx =
   T.unlines $
     [ "Target file: " <> T.pack fp
     , ""
@@ -160,7 +172,29 @@ buildMutationPrompt fp src tests =
     ( if null tests then []
       else [ "Test functions: " <> T.intercalate ", " tests, "" ]
     ) ++
+    archiveSection ++
     [ "Output ONE unified diff (--- / +++ format only, no commentary)." ]
+  where
+    archiveSection :: [Text]
+    archiveSection = case mCtx of
+      Nothing  -> []
+      Just ctx ->
+        let passPercent = T.pack (show (round (mcPassRate ctx * 100) :: Int))
+            bestStr     = T.pack (show (mcBestScore ctx))
+            totalStr    = T.pack (show (mcTotalEntries ctx))
+            recentLines = case mcRecentSuccesses ctx of
+              [] -> []
+              ss -> [ "Recent successful mutations: "
+                        <> T.intercalate "; " ss
+                    , ""
+                    ]
+            goalLines = case mcEvolutionGoal ctx of
+              Nothing -> []
+              Just g  -> ["Evolution goal: " <> g, ""]
+        in  [ "Archive statistics: " <> totalStr <> " entries, "
+                <> passPercent <> "% pass rate, best score " <> bestStr <> "."
+            , ""
+            ] ++ recentLines ++ goalLines
 
 -- | Internal type for parsing OpenRouter chat completion responses.
 newtype OracleResponse = OracleResponse Text
@@ -181,15 +215,20 @@ instance Aeson.FromJSON OracleResponse where
 -- the unified diff in the response, and wraps it as an 'HsMutation' whose
 -- 'hmTransform' applies the diff via text-level line replacement.
 --
+-- When a 'MutationContext' is provided the prompt includes archive statistics,
+-- recent successes, and the evolution goal so the oracle can propose
+-- higher-value mutations.
+--
 -- Returns @Right mutation@ on success, @Left reason@ on failure (including
 -- network errors, parse errors, or empty diffs).
 proposeMutation
   :: OracleEnv
-  -> FilePath    -- ^ Target source file (relative to repo root).
-  -> Text        -- ^ Full module source text.
-  -> [Text]      -- ^ Test function names present in the module.
+  -> FilePath            -- ^ Target source file (relative to repo root).
+  -> Text                -- ^ Full module source text.
+  -> [Text]              -- ^ Test function names present in the module.
+  -> Maybe MutationContext -- ^ Optional archive feedback for guided mutation.
   -> IO (Either Text HsMutation)
-proposeMutation env fp src tests = do
+proposeMutation env fp src tests mCtx = do
   let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
       bodyLBS = encode $ object
                   [ "model"    .= oeModel env
@@ -197,7 +236,7 @@ proposeMutation env fp src tests = do
                       [ object [ "role"    .= ("system" :: Text)
                                , "content" .= oracleSystemPrompt ]
                       , object [ "role"    .= ("user" :: Text)
-                               , "content" .= buildMutationPrompt fp src tests ]
+                               , "content" .= buildMutationPrompt fp src tests mCtx ]
                       ]
                   ]
   eReq <- try (HTTP.parseRequest url) :: IO (Either SomeException HTTP.Request)
@@ -349,11 +388,12 @@ findSubseq needle haystack = go 0 haystack
 -- @-f+with-oracle@ to enable real HTTP calls.
 proposeMutation
   :: OracleEnv
-  -> FilePath    -- ^ Target source file (relative to repo root).
-  -> Text        -- ^ Full module source text.
-  -> [Text]      -- ^ Test function names present in the module.
+  -> FilePath              -- ^ Target source file (relative to repo root).
+  -> Text                  -- ^ Full module source text.
+  -> [Text]                -- ^ Test function names present in the module.
+  -> Maybe MutationContext -- ^ Optional archive feedback for guided mutation.
   -> IO (Either Text HsMutation)
-proposeMutation _env _fp _src _tests =
+proposeMutation _env _fp _src _tests _mCtx =
   return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
 
 -- | Score and rank mutations.

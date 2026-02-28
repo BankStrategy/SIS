@@ -70,9 +70,10 @@ import DGM.SelfCompile
 import DGM.ModGraph (buildModuleGraph, removesExportedName)
 import DGM.Rewriting (DynamicRule(..), applyDynamicRules)
 import DGM.HintBridge (HintEnv, newHintEnv, evalRuleCandidate)
-import DGM.Oracle (newOracleEnv)
+import DGM.Oracle (newOracleEnv, MutationContext(..))
 import DGM.Verification (verifyEquivalence, EquivSpec(..))
-import DGM.NatLang (EvolutionGoal, applyGoal)
+import DGM.RuleMiner (minePatterns, boostByFile, evictStaleRules)
+import DGM.NatLang (EvolutionGoal, applyGoal, describeGoal)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Cycle phase
@@ -270,10 +271,31 @@ runSelfModCycle cfg = do
                Nothing   -> fps0
                Just goal -> applyGoal goal fps0
   modGraph   <- buildModuleGraph fps
-  candidates <- proposeSelfMutations st fps
+  -- Read archive for oracle context and pattern mining.
+  archiveEntries <- atomically (Archive.getAll (stateArchive st))
+  -- Build archive context for the oracle.
+  let mCtx = if null archiveEntries
+               then Nothing
+               else let passed = filter entryPassed archiveEntries
+                        total  = length archiveEntries
+                        rate   = fromIntegral (length passed) / fromIntegral total
+                        best   = maximum (map entryScore archiveEntries)
+                        recent = take 3 [ entryCode e | e <- archiveEntries, entryPassed e ]
+                        mGoalText = fmap (\g -> describeGoal g) (ccEvolutionGoal cfg)
+                    in  Just MutationContext
+                          { mcBestScore       = best
+                          , mcTotalEntries    = total
+                          , mcPassRate        = rate
+                          , mcRecentSuccesses = recent
+                          , mcEvolutionGoal   = mGoalText
+                          }
+  candidates <- proposeSelfMutations st fps mCtx
   -- Reject mutations that would remove exported names (pre-write safety).
   let safeCandiates = filter (\(_, mut, m) -> not (removesExportedName mut m)) candidates
-  let ranked = rankMutations modGraph safeCandiates
+  -- Mine archive for successful mutation patterns and boost ranking.
+  let patterns = minePatterns archiveEntries
+      ranked0  = rankMutations modGraph safeCandiates
+      ranked   = boostByFile patterns ranked0
   -- Detect oracle vs heuristic for the top candidate (oracle mutations carry
   -- an "oracle-diff: " prefix in their description, set by DGM.Oracle).
   let (proposeLabel, oracleModel) = case ranked of
@@ -529,7 +551,8 @@ runHintSubStep cfg = do
         then do
           -- ── Stage 4a: Commit — add rule to live TVar + persist ──────────
           let newRule' = newRule { drScore = scoreDelta }
-          atomically (modifyTVar' (ccDynamicRules cfg) (newRule' :))
+          atomically $ modifyTVar' (ccDynamicRules cfg) $ \rs ->
+            evictStaleRules 20 (newRule' : rs)
           -- Persist to SQLite so the rule survives restarts.
           flushDynamicRules (ccArchiveHandle cfg)
             [(drDescription newRule', candidateText, scoreDelta)]

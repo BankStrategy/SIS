@@ -434,7 +434,7 @@ oracleGoalFor targetMod = do
         else do
           src <- TIO.readFile modPath
                    `catch` (\(_ :: IOException) -> return "")
-          eResult <- proposeMutation env modPath src []
+          eResult <- proposeMutation env modPath src [] Nothing
           case eResult of
             Left err -> do
               unless ("build with -f+with-oracle" `T.isInfixOf` err) $
