@@ -1,0 +1,33 @@
+# Build artifacts
+dist-newstyle/
+*.hi
+*.o
+
+# Cabal sandboxes / old-style
+.cabal-sandbox/
+cabal.sandbox.config
+
+# Runtime / local database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment / secrets
+.env
+.env.*
+
+# Gas Town / Beads
+.beads/
+gt/
+.runtime/
+.claude/commands/
+.logs/
+.dolt/
+
+# Research / scratch
+research/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride

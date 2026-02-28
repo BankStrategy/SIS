@@ -1,0 +1,246 @@
+cabal-version: 2.4
+name:          dgm-haskell
+version:       0.1.0.0
+synopsis:      Darwin Gödel Machine — Haskell MVP
+description:
+  An autonomous self-improving system synthesising the Darwin Gödel Machine
+  (DGM) and Absolute Zero paradigms in Haskell.  Key features:
+  .
+  * GADT-based type-driven safety (Safe / Critical / Existential actions)
+  * Recursion-scheme morphisms (ana / cata / hylo) for the evolutionary loop
+  * STM-backed transactional rollback for Critical operations
+  * Formal verification hooks (SBV / LiquidHaskell-style refinement types)
+  * Dynamic sandboxed evaluation via the hint interpreter
+  * DGM expanding archive that preserves failed stepping-stones
+
+license:       MIT
+author:        Polecat rust
+maintainer:    rust@sis
+build-type:    Simple
+extra-source-files: README.md
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable real dynamic evaluation via the hint library.
+-- Disable when GHC is not present in the runtime environment (e.g. CI).
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-hint
+  description: Enable live code evaluation via the hint / GHC-API backend
+  default:     False
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable real Haskell AST parsing via ghc-exactprint.
+-- Disable when you want a lightweight build without GHC-API linkage.
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-exactprint
+  description: Enable real Haskell AST via ghc-exactprint (Phase B)
+  default:     False
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable SQLite persistence for the expanding archive.
+-- Disable only in environments where SQLite is unavailable.
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-sqlite
+  description: Enable SQLite persistence for the expanding archive
+  default:     True
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable real SMT verification via SBV/Z3.
+-- Requires Z3 in PATH at runtime.
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-sbv
+  description: Enable real SMT verification via SBV/Z3 (requires Z3 in PATH)
+  default:     False
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable LiquidHaskell as a formal pre-flight verification step.
+-- Requires LiquidHaskell 0.9.6.3.1 compatible with GHC 9.6.3+.
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-liquid
+  description: Enable LiquidHaskell verification subprocess (pillar II pre-flight)
+  default:     False
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Optional flag: enable the OpenRouter LLM oracle for mutation proposal.
+-- Requires OPENROUTER_API_KEY env var or .env file at repo root.
+-- ────────────────────────────────────────────────────────────────────────────
+flag with-oracle
+  description: Enable OpenRouter LLM mutation proposer (requires API key)
+  default:     False
+  manual:      True
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Library
+-- ────────────────────────────────────────────────────────────────────────────
+library
+  exposed-modules:
+      DGM
+    , DGM.Types
+    , DGM.AST
+    , DGM.HsAST
+    , DGM.Rewriting
+    , DGM.Verification
+    , DGM.Sandbox
+    , DGM.HintBridge
+    , DGM.Archive
+    , DGM.Evolution
+    , DGM.AbsoluteZero
+    , DGM.SafetyKernel
+    , DGM.Cycle
+    , DGM.SelfMod
+    , DGM.SelfCompile
+    , DGM.ModGraph
+    , DGM.Reversal
+    , DGM.Liquid
+    , DGM.Oracle
+    , DGM.OracleHandle
+    , DGM.NatLang
+  hs-source-dirs:  src
+  default-language: Haskell2010
+  default-extensions:
+      GADTs
+    , DataKinds
+    , KindSignatures
+    , RankNTypes
+    , ScopedTypeVariables
+    , OverloadedStrings
+    , LambdaCase
+    , RecordWildCards
+    , TupleSections
+    , FlexibleContexts
+    , FlexibleInstances
+    , TypeFamilies
+    , DeriveFunctor
+    , DeriveFoldable
+    , DeriveTraversable
+    , GeneralizedNewtypeDeriving
+  ghc-options:
+      -Wall
+      -Wcompat
+      -Wincomplete-record-updates
+      -Wincomplete-uni-patterns
+      -Wredundant-constraints
+  build-depends:
+      base        >= 4.14 && < 5
+    , stm         >= 2.5
+    , containers  >= 0.6
+    , text        >= 1.2
+    , bytestring  >= 0.10
+    , mtl         >= 2.2
+    , transformers >= 0.5
+    , random      >= 1.2
+    , time        >= 1.9
+    , async       >= 2.2
+    , aeson       >= 2.0
+    , deepseq     >= 1.4
+    , uuid               >= 1.3
+    , cryptohash-sha256  >= 0.11
+    , base16-bytestring  >= 1.0
+    , filepath           >= 1.4
+    , directory          >= 1.3
+    , process            >= 1.6
+  if flag(with-hint)
+    build-depends: hint >= 0.9
+    cpp-options: -DWITH_HINT
+  if flag(with-exactprint)
+    build-depends:
+        ghc-exactprint >= 1.6 && < 2
+      , ghc
+    cpp-options: -DWITH_EXACTPRINT
+  if flag(with-sqlite)
+    build-depends: sqlite-simple >= 0.4
+    cpp-options: -DWITH_SQLITE
+  if flag(with-sbv)
+    build-depends: sbv >= 10.0
+    cpp-options: -DWITH_SBV
+  if flag(with-liquid)
+    build-depends:
+        liquidhaskell == 0.9.6.3.1
+      , liquid-prelude
+      , liquid-base
+    cpp-options: -DWITH_LIQUID
+  if flag(with-oracle)
+    build-depends:
+        http-conduit  >= 2.3
+      , http-client-tls >= 0.3
+    cpp-options: -DWITH_ORACLE
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Executable
+-- ────────────────────────────────────────────────────────────────────────────
+executable dgm
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: Haskell2010
+  default-extensions:
+      OverloadedStrings
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base
+    , dgm-haskell
+    , text
+    , stm
+    , directory  >= 1.3
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Demo executable
+-- ────────────────────────────────────────────────────────────────────────────
+executable dgm-demo
+  main-is:          Demo.hs
+  hs-source-dirs:   app
+  default-language: Haskell2010
+  default-extensions:
+      OverloadedStrings
+      LambdaCase
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base
+    , dgm-haskell
+    , text
+    , stm
+    , containers
+    , time        >= 1.9
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Test suite
+-- ────────────────────────────────────────────────────────────────────────────
+test-suite dgm-test
+  type:             exitcode-stdio-1.0
+  main-is:          Spec.hs
+  hs-source-dirs:   test
+  default-language: Haskell2010
+  default-extensions:
+      OverloadedStrings
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base
+    , dgm-haskell
+    , tasty            >= 1.4
+    , tasty-hunit      >= 0.10
+    , tasty-quickcheck >= 0.10
+    , QuickCheck       >= 2.14
+    , text
+    , stm
+    , containers
+    , directory   >= 1.3
+    , filepath    >= 1.4
+    , process     >= 1.6
+    , time        >= 1.9
+  if flag(with-sqlite)
+    build-depends:
+        sqlite-simple >= 0.4
+    cpp-options: -DWITH_SQLITE
+  if flag(with-hint)
+    cpp-options: -DWITH_HINT
+  if flag(with-exactprint)
+    cpp-options: -DWITH_EXACTPRINT
+  if flag(with-sbv)
+    cpp-options: -DWITH_SBV
+  if flag(with-liquid)
+    cpp-options: -DWITH_LIQUID
+  if flag(with-oracle)
+    cpp-options: -DWITH_ORACLE

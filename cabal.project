@@ -1,0 +1,7 @@
+packages: .
+
+-- Uncomment for real hint integration (requires GHC in runtime PATH):
+-- flags: +with-hint
+
+-- Reproducible solver plan
+index-state: 2024-12-01T00:00:00Z
