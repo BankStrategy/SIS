@@ -26,6 +26,8 @@ module DGM.Archive
   , loadArchive
   , flushBlacklist
   , loadBlacklist
+  , flushDynamicRules
+  , loadDynamicRules
     -- * Serialisation
   , archiveToJSON
   , jsonToArchive
@@ -175,6 +177,10 @@ data ArchiveHandle = ArchiveHandle
     -- ^ Persist (filePath, mutationDesc) pairs that have failed.
   , ahLoadBlacklist  :: IO [(FilePath, Text)]
     -- ^ Load all persisted blacklist entries on startup.
+  , ahFlushDynamicRules :: [(Text, Text, Double)] -> IO ()
+    -- ^ Persist (description, snippet, score) triples for successful dynamic rules.
+  , ahLoadDynamicRules  :: IO [(Text, Text, Double)]
+    -- ^ Load all persisted dynamic rules on startup.
   }
 
 -- | Open an archive handle for the given backend.
@@ -183,33 +189,40 @@ data ArchiveHandle = ArchiveHandle
 -- is created if it does not already exist and the handle owns the connection.
 openArchive :: ArchiveBackend -> IO ArchiveHandle
 openArchive InMemory = pure ArchiveHandle
-  { ahFlush          = \_ -> pure ()
-  , ahLoad           = pure []
-  , ahClose          = pure ()
-  , ahFlushBlacklist = \_ -> pure ()
-  , ahLoadBlacklist  = pure []
+  { ahFlush            = \_ -> pure ()
+  , ahLoad             = pure []
+  , ahClose            = pure ()
+  , ahFlushBlacklist   = \_ -> pure ()
+  , ahLoadBlacklist    = pure []
+  , ahFlushDynamicRules = \_ -> pure ()
+  , ahLoadDynamicRules  = pure []
   }
 #ifdef WITH_SQLITE
 openArchive (SQLiteBacked path) = do
   conn <- SQL.open path
   SQL.execute_ conn sqlCreateTable
   SQL.execute_ conn sqlCreateBlacklistTable
+  SQL.execute_ conn sqlCreateDynamicRulesTable
   pure ArchiveHandle
-    { ahFlush          = sqlFlush conn
-    , ahLoad           = sqlLoad conn
-    , ahClose          = SQL.close conn
-    , ahFlushBlacklist = sqlFlushBlacklist conn
-    , ahLoadBlacklist  = sqlLoadBlacklist conn
+    { ahFlush            = sqlFlush conn
+    , ahLoad             = sqlLoad conn
+    , ahClose            = SQL.close conn
+    , ahFlushBlacklist   = sqlFlushBlacklist conn
+    , ahLoadBlacklist    = sqlLoadBlacklist conn
+    , ahFlushDynamicRules = sqlFlushDynamicRules conn
+    , ahLoadDynamicRules  = sqlLoadDynamicRules conn
     }
 #else
 openArchive (SQLiteBacked _) = do
   putStrLn "Warning: SQLite support not compiled in; falling back to in-memory archive"
   pure ArchiveHandle
-    { ahFlush          = \_ -> pure ()
-    , ahLoad           = pure []
-    , ahClose          = pure ()
-    , ahFlushBlacklist = \_ -> pure ()
-    , ahLoadBlacklist  = pure []
+    { ahFlush            = \_ -> pure ()
+    , ahLoad             = pure []
+    , ahClose            = pure ()
+    , ahFlushBlacklist   = \_ -> pure ()
+    , ahLoadBlacklist    = pure []
+    , ahFlushDynamicRules = \_ -> pure ()
+    , ahLoadDynamicRules  = pure []
     }
 #endif
 
@@ -232,6 +245,14 @@ flushBlacklist = ahFlushBlacklist
 -- | Load all persisted blacklist entries from storage.
 loadBlacklist :: ArchiveHandle -> IO [(FilePath, Text)]
 loadBlacklist = ahLoadBlacklist
+
+-- | Persist a batch of (description, snippet, score) dynamic rule triples.
+flushDynamicRules :: ArchiveHandle -> [(Text, Text, Double)] -> IO ()
+flushDynamicRules = ahFlushDynamicRules
+
+-- | Load all persisted dynamic rules from storage.
+loadDynamicRules :: ArchiveHandle -> IO [(Text, Text, Double)]
+loadDynamicRules = ahLoadDynamicRules
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SQLite implementation (compiled only when WITH_SQLITE is defined)
@@ -296,6 +317,23 @@ sqlLoadBlacklist :: SQL.Connection -> IO [(FilePath, Text)]
 sqlLoadBlacklist conn = do
   rows <- SQL.query_ conn
     "SELECT file_path, mutation_desc FROM mutation_blacklist"
+  pure rows
+
+sqlCreateDynamicRulesTable :: SQL.Query
+sqlCreateDynamicRulesTable =
+  "CREATE TABLE IF NOT EXISTS dynamic_rules (description TEXT PRIMARY KEY, snippet TEXT NOT NULL, score REAL NOT NULL)"
+
+sqlFlushDynamicRules :: SQL.Connection -> [(Text, Text, Double)] -> IO ()
+sqlFlushDynamicRules conn triples = SQL.withTransaction conn $
+  mapM_ (\(desc, snip, sc) ->
+    SQL.execute conn
+      "INSERT OR REPLACE INTO dynamic_rules (description, snippet, score) VALUES (?,?,?)"
+      (desc, snip, sc)) triples
+
+sqlLoadDynamicRules :: SQL.Connection -> IO [(Text, Text, Double)]
+sqlLoadDynamicRules conn = do
+  rows <- SQL.query_ conn
+    "SELECT description, snippet, score FROM dynamic_rules"
   pure rows
 
 #endif

@@ -260,7 +260,8 @@ demoAbsoluteZero = do
   note $ "Initial capability estimate: " <> show (propCurrentDifficulty prop0)
   note $ "Exploration rate: " <> show (propExplorationRate prop0)
   note $ "Target difficulty: " <> show (propCurrentDifficulty prop0 + propExplorationRate prop0)
-  (task0, _) <- proposeTask prop0
+  st0 <- newAgentState (exprToASTNode "demo" bootstrapExpr)
+  (task0, _) <- proposeTask st0 prop0
   result $ "Proposed task: " <> show (taskId task0)
            <> " (difficulty=" <> show (taskDifficulty task0) <> ")"
 
@@ -275,7 +276,7 @@ demoAbsoluteZero = do
 
   sub "4d. Self-play loop — capability adapts over 5 steps"
   note "Running 5 self-play steps; difficulty estimate should rise as tasks are solved:"
-  let cfg = defaultSelfPlayConfig
+  let cfg = defaultSelfPlayConfig st0
   runSelfPlay cfg 5 (propCurrentDifficulty (spProposer cfg))
 
   sub "4e. Accuracy reward function"

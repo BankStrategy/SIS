@@ -56,7 +56,7 @@ import DGM.AbsoluteZero
 import DGM.Evolution
 
 import DGM.Sandbox (runExprInSandbox, defaultSandboxConfig, SandboxResult(..))
-import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flushArchive, flushBlacklist)
+import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flushArchive, flushBlacklist, flushDynamicRules)
 import DGM.SafetyKernel
 import qualified DGM.Archive as Archive
 
@@ -118,7 +118,7 @@ defaultCycleConfig st auditLog hdl = do
   hintEnv  <- newHintEnv
   pure CycleConfig
     { ccAgentState       = st
-    , ccSelfPlayCfg      = defaultSelfPlayConfig
+    , ccSelfPlayCfg      = defaultSelfPlayConfig st
     , ccEvolutionCfg     = defaultEvolutionConfig st
     , ccAuditLog         = auditLog
     , ccVerbose          = True
@@ -527,11 +527,14 @@ runHintSubStep cfg = do
 
       if scoreDelta > 0
         then do
-          -- ── Stage 4a: Commit — add rule to live TVar ────────────────────
+          -- ── Stage 4a: Commit — add rule to live TVar + persist ──────────
           let newRule' = newRule { drScore = scoreDelta }
           atomically (modifyTVar' (ccDynamicRules cfg) (newRule' :))
+          -- Persist to SQLite so the rule survives restarts.
+          flushDynamicRules (ccArchiveHandle cfg)
+            [(drDescription newRule', candidateText, scoreDelta)]
           let stepCommit = StepResult StepPersist True
-                             ("HintCommit: rule added to live set")
+                             ("HintCommit: rule added to live set + persisted")
           emit cfg stepCommit
           return [stepPropose, stepEval, stepTest, stepCommit]
         else do

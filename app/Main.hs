@@ -15,9 +15,9 @@
 -- printed on startup to identify the current evolutionary generation.
 module Main where
 
-import Control.Concurrent.STM (atomically, writeTVar, readTVar)
+import Control.Concurrent.STM (atomically, writeTVar, readTVar, modifyTVar')
 import Control.Exception (bracket)
-import Control.Monad (replicateM, when)
+import Control.Monad (replicateM, when, forM_)
 import Data.IORef (newIORef)
 import Data.Text (Text)
 import qualified Data.Set as Set
@@ -93,9 +93,22 @@ main = do
     when (not (null priorBlacklist)) $
       putStrLn $ "Loaded " <> show (length priorBlacklist) <> " blacklisted mutations.\n"
 
+    -- Load persisted dynamic rules and evaluate them via HintBridge.
+    priorRules <- loadDynamicRules hdl
+    when (not (null priorRules)) $
+      putStrLn $ "Loading " <> show (length priorRules) <> " persisted dynamic rules...\n"
+
     -- Build cycle configuration; inject goal if provided.
     cfg0 <- defaultCycleConfig st auditLog hdl
     let cfg = cfg0 { ccEvolutionGoal = mGoal }
+
+    -- Evaluate persisted rule snippets and inject into live rule set.
+    forM_ priorRules $ \(desc, snippet, sc) -> do
+      eResult <- evalRuleCandidate (ccHintEnv cfg) snippet
+      case eResult of
+        Left _err -> pure ()   -- Skip rules that fail to evaluate.
+        Right fn  -> atomically $ modifyTVar' (ccDynamicRules cfg)
+          (DynamicRule desc fn sc :)
 
     case mode of
       RunZeroData cycles -> do

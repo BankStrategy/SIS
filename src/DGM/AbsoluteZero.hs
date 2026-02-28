@@ -32,6 +32,9 @@ module DGM.AbsoluteZero
   , defaultProposer
   , proposeTask
   , proposeSelfModTask
+    -- * SBV queue integration
+  , proposeFromSbvQueue
+  , counterExampleTask
     -- * Solver
   , SolverResult(..)
   , solveTask
@@ -45,6 +48,7 @@ module DGM.AbsoluteZero
   , runSelfPlayStep
   ) where
 
+import Control.Concurrent.STM (atomically, readTVar, writeTVar)
 import Control.Exception (catch, IOException)
 import Control.Monad (unless)
 import Data.Text (Text)
@@ -213,7 +217,62 @@ taskLibrary =
   , (0.3,  simplifyTask (binop "+" (lit 3) (lit 4)))
   , (0.4,  simplifyTask (binop "*" (lit 2) (binop "+" (lit 3) (lit 0))))
   , (0.5,  equivTask (binop "+" (lit 2) (lit 3)) (lit 5))
+    -- Multi-step tasks requiring multiple rule applications:
+  , (0.55, multiStepTask1)
+  , (0.6,  multiStepTask2)
+  , (0.65, nestedTask1)
+  , (0.7,  varSimplifyTask)
   ]
+
+-- | Task requiring constant-fold AND identity elimination.
+-- (2 + 3) * (1 + 0) -> 5 * 1 -> 5
+multiStepTask1 :: Task
+multiStepTask1 = Task
+  { taskId          = "multi-step-1"
+  , taskType        = ArithmeticTask
+  , taskDifficulty  = 0.55
+  , taskDescription = "Simplify (2+3)*(1+0) to a literal"
+  , taskSpec        = ExprTask (binop "*" (binop "+" (lit 2) (lit 3))
+                                          (binop "+" (lit 1) (lit 0)))
+  , taskVerify      = \result _env -> result == lit 5
+  }
+
+-- | Task requiring multiple constant-fold passes.
+-- (1 + 2) + (3 + 4) -> 3 + 7 -> 10
+multiStepTask2 :: Task
+multiStepTask2 = Task
+  { taskId          = "multi-step-2"
+  , taskType        = ArithmeticTask
+  , taskDifficulty  = 0.6
+  , taskDescription = "Simplify (1+2)+(3+4) to a literal"
+  , taskSpec        = ExprTask (binop "+" (binop "+" (lit 1) (lit 2))
+                                          (binop "+" (lit 3) (lit 4)))
+  , taskVerify      = \result _env -> result == lit 10
+  }
+
+-- | Deeply nested arithmetic requiring recursive reduction.
+-- ((1+1) + 2) + 0 -> (2 + 2) + 0 -> 4 + 0 -> 4
+nestedTask1 :: Task
+nestedTask1 = Task
+  { taskId          = "nested-1"
+  , taskType        = ArithmeticTask
+  , taskDifficulty  = 0.65
+  , taskDescription = "Simplify ((1+1)+2)+0 to a literal"
+  , taskSpec        = ExprTask (binop "+" (binop "+" (binop "+" (lit 1) (lit 1)) (lit 2)) (lit 0))
+  , taskVerify      = \result _env -> result == lit 4
+  }
+
+-- | Variable simplification via identity elimination.
+-- x + 0 -> x
+varSimplifyTask :: Task
+varSimplifyTask = Task
+  { taskId          = "var-simplify"
+  , taskType        = ArithmeticTask
+  , taskDifficulty  = 0.7
+  , taskDescription = "Simplify x+0 to x via identity elimination"
+  , taskSpec        = ExprTask (binop "+" (var "x") (lit 0))
+  , taskVerify      = \result _env -> result == var "x"
+  }
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Proposer
@@ -248,28 +307,37 @@ defaultProposer = Proposer
 --
 -- Dispatches on 'propCurrentPhase': 'ExprMode' yields an expression task;
 -- 'SelfModMode' yields a self-modification task targeting the live module graph.
-proposeTask :: Proposer -> IO (Task, Proposer)
-proposeTask p
+--
+-- The 'AgentState' is threaded through so that ExprMode can consume
+-- counter-examples from the SBV queue before falling back to the task library.
+proposeTask :: AgentState -> Proposer -> IO (Task, Proposer)
+proposeTask st p
   | propCurrentPhase p == SelfModMode = proposeSelfModTask p
-  | otherwise                         = proposeExprTask p
+  | otherwise                         = proposeExprTask st p
 
 -- | Propose an expression task at the agent's current Pareto frontier.
 --
+-- First tries the SBV counter-example queue; falls back to the task library.
 -- Filters out already-solved tasks so the Proposer never loops on the same
 -- task.  When the entire library is exhausted, generates a fresh arithmetic
 -- task procedurally.  Increments 'propSelfModCounter' so that 'runCycleN'
 -- can trigger phase transitions at the 'ccSelfModRateLimit' cadence.
-proposeExprTask :: Proposer -> IO (Task, Proposer)
-proposeExprTask prop = do
-  let target = propCurrentDifficulty prop + propExplorationRate prop
-      solved = propSolvedTasks prop
-      avail  = filter (\(_, t) -> taskId t `Set.notMember` solved) taskLibrary
-  noise <- randomRIO (-0.05, 0.05)
-  task <- if null avail
-            then generateProceduralTask (target + noise)
-            else pure (pickNearest (target + noise) avail)
-  let newProp = prop { propSelfModCounter = propSelfModCounter prop + 1 }
-  pure (task, newProp)
+proposeExprTask :: AgentState -> Proposer -> IO (Task, Proposer)
+proposeExprTask st prop = do
+  -- First try the SBV queue for counter-example-derived tasks.
+  mSbvTask <- proposeFromSbvQueue st
+  case mSbvTask of
+    Just task -> return (task, prop { propSelfModCounter = propSelfModCounter prop + 1 })
+    Nothing   -> do
+      let target = propCurrentDifficulty prop + propExplorationRate prop
+          solved = propSolvedTasks prop
+          avail  = filter (\(_, t) -> taskId t `Set.notMember` solved) taskLibrary
+      noise <- randomRIO (-0.05, 0.05)
+      task <- if null avail
+                then generateProceduralTask (target + noise)
+                else pure (pickNearest (target + noise) avail)
+      let newProp = prop { propSelfModCounter = propSelfModCounter prop + 1 }
+      pure (task, newProp)
   where
     pickNearest t tasks =
       snd $ foldr1 (\a b -> if abs (fst a - t) < abs (fst b - t) then a else b) tasks
@@ -380,6 +448,38 @@ oracleGoalFor targetMod = do
                 else AddRewriteRule (hmDescription mut)
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- SBV queue integration
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Try to consume a counter-example from the SBV queue as an ExprPhase task.
+-- Returns Nothing if the queue is empty.
+proposeFromSbvQueue :: AgentState -> IO (Maybe Task)
+proposeFromSbvQueue st = do
+  mCe <- atomically $ do
+    q <- readTVar (stateSbvQueue st)
+    case q of
+      []       -> return Nothing
+      (ce:rest) -> do
+        writeTVar (stateSbvQueue st) rest
+        return (Just ce)
+  return $ fmap counterExampleTask mCe
+
+-- | Build an ExprPhase task from an SBV counter-example.
+counterExampleTask :: CounterExample -> Task
+counterExampleTask ce = Task
+  { taskId          = "sbv-ce-" <> ceExpected ce
+  , taskType        = EquivalenceTask
+  , taskDifficulty  = 0.8
+  , taskDescription = "Resolve SBV counter-example: expected=" <> ceExpected ce
+                   <> " actual=" <> ceActual ce
+  , taskSpec        = ExprTask (lit 0)
+  , taskVerify      = \result env ->
+      case evalExpr env result of
+        Right val -> T.pack (show val) == ceExpected ce
+        Left _    -> False
+  }
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Solver
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -398,16 +498,28 @@ solveTask task = case taskSpec task of
   SelfModTask spec -> solveSelfModTask task spec
 
 -- | Solve an expression task using the rewriting engine.
+--
+-- Accuracy is /reduction-based/: a mere identity transformation (no AST
+-- shrinkage) receives minimal credit (0.2), rules that fired without net
+-- reduction get partial credit (0.4), and only genuine simplification (fewer
+-- nodes) scores 1.0.  Breaking semantics always yields 0.0.
 solveExprTask :: Task -> Expr -> IO SolverResult
 solveExprTask task expr = do
-  let (simplified, steps, _) = rewrite defaultConfig defaultRules expr
+  let (simplified, stepsUsed, _) = rewrite defaultConfig defaultRules expr
   let env = Map.fromList [("n", VInt 5), ("x", VInt 3), ("y", VInt 4)]
-  let acc = if taskVerify task simplified env then 1.0 else 0.0
+  let equiv     = taskVerify task simplified env
+      origNodes = countNodes expr
+      simpNodes = countNodes simplified
+      reduced   = simpNodes < origNodes
+      acc | not equiv     = 0.0   -- broke semantics: total failure
+          | reduced       = 1.0   -- genuine simplification: full credit
+          | stepsUsed > 0 = 0.4   -- rules fired but no net reduction
+          | otherwise     = 0.2   -- identity transformation: minimal credit
   pure SolverResult
     { srTaskId    = taskId task
     , srSolution  = if acc > 0 then Just simplified else Nothing
     , srAccuracy  = acc
-    , srStepsUsed = steps
+    , srStepsUsed = stepsUsed
     }
 
 -- | Feasibility check for a self-modification task (Phase G).
@@ -462,13 +574,15 @@ accuracyReward = srAccuracy
 
 data SelfPlayConfig = SelfPlayConfig
   { spProposer       :: Proposer
-  , spAdaptRate      :: Double  -- ^ How fast difficulty estimate adapts.
+  , spAdaptRate      :: Double       -- ^ How fast difficulty estimate adapts.
+  , spAgentState     :: AgentState   -- ^ Agent state for SBV queue access.
   }
 
-defaultSelfPlayConfig :: SelfPlayConfig
-defaultSelfPlayConfig = SelfPlayConfig
-  { spProposer  = defaultProposer
-  , spAdaptRate = 0.05
+defaultSelfPlayConfig :: AgentState -> SelfPlayConfig
+defaultSelfPlayConfig st = SelfPlayConfig
+  { spProposer   = defaultProposer
+  , spAdaptRate  = 0.05
+  , spAgentState = st
   }
 
 -- | Run one Absolute Zero self-play step.
@@ -478,17 +592,16 @@ defaultSelfPlayConfig = SelfPlayConfig
 -- the full @SolverResult@.
 runSelfPlayStep :: SelfPlayConfig -> IO (Proposer, SolverResult)
 runSelfPlayStep cfg = do
-  (task, prop') <- proposeTask (spProposer cfg)
+  (task, prop') <- proposeTask (spAgentState cfg) (spProposer cfg)
   result <- solveTask task
   let acc    = accuracyReward result
       cap    = propCurrentDifficulty prop'
-      -- Adapt: if solved, raise difficulty.  If failed, lower slightly.
-      -- Partial credit (0 < acc < 1) gives a proportional gradient rather
-      -- than freezing the difficulty estimate.
+      -- Adapt: genuine simplification (acc=1.0) raises difficulty;
+      -- total failure (acc=0.0) lowers it; partial credit holds steady.
       newCap
         | acc >= 1.0 = min 1.0 (cap + spAdaptRate cfg)
         | acc <= 0.0 = max 0.0 (cap - spAdaptRate cfg * 0.5)
-        | otherwise  = cap + (acc - 0.5) * spAdaptRate cfg
+        | otherwise  = cap
       -- Record solved tasks so they are not re-proposed.
       newSolved
         | acc >= 1.0 = Set.insert (taskId task) (propSolvedTasks prop')
