@@ -50,6 +50,7 @@ import Data.Maybe (mapMaybe)
 import DGM.HsAST (HsMutation(..))
 
 #ifdef WITH_ORACLE
+import Control.Monad (foldM)
 import Data.Aeson ((.:), (.=), object, encode, withObject)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Char8 as BS8
@@ -252,46 +253,79 @@ oracleHealthCheck env = do
 -- Diff parsing and application (WITH_ORACLE only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- | A single hunk from a unified diff.
+data DiffHunk = DiffHunk
+  { hunkRemoves :: [Text]  -- ^ lines to remove (leading @-@ stripped)
+  , hunkAdds    :: [Text]  -- ^ lines to add (leading @+@ stripped)
+  } deriving (Show, Eq)
+
+-- | Split diff lines into hunks. Each hunk starts at a @\@\@ ... \@\@@ header line.
+-- Everything before the first @\@\@ @ line is discarded (it's the --- / +++ header).
+splitIntoHunks :: [Text] -> [DiffHunk]
+splitIntoHunks ls =
+  let afterHeader = dropWhile (\l -> not ("@@ " `T.isPrefixOf` l)) ls
+  in  parseGroups afterHeader
+  where
+    parseGroups [] = []
+    parseGroups (_h:rest) =
+      -- _h is the @@ header line; collect body until next @@
+      let (body, remainder) = break ("@@ " `T.isPrefixOf`) rest
+          hunk = toHunk body
+      in  hunk : parseGroups remainder
+
+    toHunk bodyLines = DiffHunk
+      { hunkRemoves = [ T.drop 1 l | l <- bodyLines
+                                    , "-" `T.isPrefixOf` l
+                                    , not ("---" `T.isPrefixOf` l) ]
+      , hunkAdds    = [ T.drop 1 l | l <- bodyLines
+                                    , "+" `T.isPrefixOf` l
+                                    , not ("+++" `T.isPrefixOf` l) ]
+      }
+
+-- | Apply a single hunk to source lines.
+-- For hunks with removes: find removes as contiguous block, replace with adds.
+-- For insert-only hunks: append adds at end.
+applyHunk :: DiffHunk -> [Text] -> Either Text [Text]
+applyHunk DiffHunk{..} srcLines
+  | null hunkRemoves =
+      -- Insert-only: append at end (conservative but safe)
+      Right (srcLines ++ hunkAdds)
+  | otherwise =
+      case findSubseq hunkRemoves srcLines of
+        Nothing  -> Left "oracle diff: hunk removes not found in source"
+        Just idx ->
+          let before = take idx srcLines
+              after  = drop (idx + length hunkRemoves) srcLines
+          in  Right (before ++ hunkAdds ++ after)
+
 -- | Parse a unified diff from an LLM text response into an 'HsMutation'.
 --
--- Locates the first @---@ line, extracts @-@ (remove) and @+@ (add) lines
--- from the hunk body (skipping @---@\/@+++@ header lines), and builds an
--- 'HsMutation' whose transform applies the diff via line-level replacement.
+-- Splits the diff into per-hunk structures and applies them sequentially,
+-- so multi-hunk diffs work correctly.
 parseDiffResponse :: Text -> Either Text HsMutation
 parseDiffResponse content =
-  let ls         = T.lines content
-      fromHeader = dropWhile (not . ("---" `T.isPrefixOf`)) ls
-      hunkLines  = dropWhile (\l -> "---" `T.isPrefixOf` l
-                                 || "+++" `T.isPrefixOf` l) fromHeader
-      removes    = [ T.drop 1 l | l <- hunkLines
-                                 , "-" `T.isPrefixOf` l
-                                 , not ("---" `T.isPrefixOf` l) ]
-      adds       = [ T.drop 1 l | l <- hunkLines
-                                 , "+" `T.isPrefixOf` l
-                                 , not ("+++" `T.isPrefixOf` l) ]
-  in if null removes && null adds
-       then Left "oracle: empty diff in LLM response"
-       else Right HsMutation
-              { hmDescription = "oracle-diff: " <> T.take 50 (T.strip content)
-              , hmTransform   = applyLineDiff removes adds
-              }
+  let ls    = T.lines content
+      hunks = splitIntoHunks ls
+      nonEmpty = filter (\h -> not (null (hunkRemoves h)) || not (null (hunkAdds h))) hunks
+  in  if null nonEmpty
+        then Left "oracle: no hunks found in diff response"
+        else Right HsMutation
+               { hmDescription = "oracle-diff: " <> T.take 50 (T.strip content)
+               , hmTransform   = applyAllHunks nonEmpty
+               }
+  where
+    applyAllHunks :: [DiffHunk] -> Text -> Either Text Text
+    applyAllHunks hs src = fmap T.unlines $ foldM applyOneHunk (T.lines src) hs
+      where
+        applyOneHunk acc h = applyHunk h acc
 
--- | Apply a text-level line-replacement diff to module source.
+-- | Apply a text-level line-replacement diff to module source (backward compat).
 --
--- Finds the first contiguous occurrence of @removes@ in the source lines
--- and replaces it with @adds@.  Returns @Left@ when the remove block
--- cannot be located.
+-- Wraps the given removes\/adds as a single 'DiffHunk' and applies it.
 applyLineDiff :: [Text] -> [Text] -> Text -> Either Text Text
-applyLineDiff removes adds src
-  | null removes = Right (src <> T.unlines adds)
-  | otherwise    =
-      let srcLines = T.lines src
-      in case findSubseq removes srcLines of
-           Nothing  -> Left "oracle diff: remove block not found in source"
-           Just idx ->
-             let before = take idx srcLines
-                 after  = drop (idx + length removes) srcLines
-             in Right (T.unlines (before ++ adds ++ after))
+applyLineDiff removes adds src =
+  let hunk = DiffHunk { hunkRemoves = removes, hunkAdds = adds }
+  in  fmap T.unlines $ applyHunk hunk (T.lines src)
 
 -- | Find the first index of @needle@ as a contiguous sublist of @haystack@.
 findSubseq :: Eq a => [a] -> [a] -> Maybe Int
