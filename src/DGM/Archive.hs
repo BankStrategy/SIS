@@ -252,9 +252,12 @@ sqlLoad conn = do
       , entryMutation   = Nothing
       , entryParentId   = parentId
       , entryScore      = score
-      , entryPassed     = passed /= (0 :: Int)
-      , entryGeneration = gen
-      , entryCounterEx  = cex >>= Aeson.decode . BL.fromStrict . TE.encodeUtf8
+      , entryPassed       = passed /= (0 :: Int)
+      , entryGeneration   = gen
+      , entryCounterEx    = cex >>= Aeson.decode . BL.fromStrict . TE.encodeUtf8
+      , entryLiquidResult = Nothing
+      , entrySbvResult    = Nothing
+      , entryOracleModel  = Nothing
       }
 
 #endif

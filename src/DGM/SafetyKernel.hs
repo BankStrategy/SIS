@@ -43,7 +43,7 @@ import qualified Data.Map.Strict as Map
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString.Base16 as B16
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
-import System.FilePath (isRelative, normalise, splitPath)
+import System.FilePath (isAbsolute, normalise, splitPath)
 import System.IO (hPutStr, withFile, IOMode(..))
 import System.Directory (removeFile, renameFile)
 import System.IO.Error (isDoesNotExistError)
@@ -303,7 +303,8 @@ checkPathWhitelist repoRoot path
       Left "Path not whitelisted: stateRepoRoot is not configured"
   | otherwise =
       let srcDir    = normalise (repoRoot <> "/src/")
-          normPath  = normalise path
+          absPath   = if isAbsolute path then path else repoRoot <> "/" <> path
+          normPath  = normalise absPath
           -- Check that normPath starts with srcDir.
           -- splitPath srcDir gives path components including trailing slash on dirs.
           srcParts  = splitPath srcDir

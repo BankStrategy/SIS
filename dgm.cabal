@@ -150,6 +150,7 @@ library
     build-depends:
         ghc-exactprint >= 1.6 && < 2
       , ghc
+      , ghc-paths
     cpp-options: -DWITH_EXACTPRINT
   if flag(with-sqlite)
     build-depends: sqlite-simple >= 0.4

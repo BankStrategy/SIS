@@ -138,11 +138,11 @@ parseDotEnv = mapMaybe parseLine . T.lines
 -- | System role message sent with every mutation-proposal request.
 oracleSystemPrompt :: Text
 oracleSystemPrompt =
-  "You are a mutation oracle for DGM, a self-improving Haskell system. \
-  \Propose exactly ONE small, safe improvement to the given Haskell module \
-  \as a unified diff. Output ONLY the diff, starting with --- lines and \
-  \ending after the last +++ block. Do not include any explanation or \
-  \markdown fences."
+  "You are a mutation oracle for DGM, a self-improving Haskell system. " <>
+  "Propose exactly ONE small, safe improvement to the given Haskell module " <>
+  "as a unified diff. Output ONLY the diff, starting with --- lines and " <>
+  "ending after the last +++ block. Do not include any explanation or " <>
+  "markdown fences."
 
 -- | Build the user-role prompt for a mutation request.
 buildMutationPrompt :: FilePath -> Text -> [Text] -> Text

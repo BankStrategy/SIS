@@ -149,12 +149,12 @@ instance Aeson.FromJSON MutationConstraint where
 -- | System prompt for the goal-parsing oracle call.
 goalSystemPrompt :: Text
 goalSystemPrompt =
-  "You are a mutation steering oracle for DGM, a self-improving Haskell system. \
-  \Given a natural-language evolution goal, return ONLY a JSON array of constraint \
-  \objects with no explanation. Each object must have a 'type' field set to one of: \
-  \'PreferModule' (with 'name' string), 'AvoidModule' (with 'name' string), \
-  \'MaxImpact' (with 'value' integer), 'RequireTests', 'GoalText' (with 'text' string). \
-  \Example: [{\"type\":\"PreferModule\",\"name\":\"Archive\"}]"
+  "You are a mutation steering oracle for DGM, a self-improving Haskell system. " <>
+  "Given a natural-language evolution goal, return ONLY a JSON array of constraint " <>
+  "objects with no explanation. Each object must have a 'type' field set to one of: " <>
+  "'PreferModule' (with 'name' string), 'AvoidModule' (with 'name' string), " <>
+  "'MaxImpact' (with 'value' integer), 'RequireTests', 'GoalText' (with 'text' string). " <>
+  "Example: [{\"type\":\"PreferModule\",\"name\":\"Archive\"}]"
 
 #else
 

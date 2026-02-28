@@ -39,11 +39,8 @@ import Data.Maybe (mapMaybe)
 import qualified Language.Haskell.GHC.ExactPrint as EP
 import qualified Language.Haskell.GHC.ExactPrint.Parsers as EPP
 import qualified GHC (ParsedSource)
-import Control.Exception (bracket, try, SomeException)
-import System.Directory (getTemporaryDirectory, removeFile)
-import System.FilePath ((</>))
-import System.IO (writeFile)
-import System.Random (randomRIO)
+import GHC.Paths (libdir)
+import Control.Exception (try, SomeException)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Core types (real implementation)
@@ -93,25 +90,21 @@ type HsRuleSet = [HsRewriteRule]
 -- Returns @'Left' err@ on parse failure.
 parseHsFile :: FilePath -> IO (Either Text HsModule)
 parseHsFile fp = do
-  result <- EPP.parseFile fp
-  pure $ case result of
-    Left (_, errMsg) -> Left (T.pack errMsg)
-    Right ps         -> Right (HsModuleParsed ps)
+  r <- try (EPP.parseModule libdir fp) :: IO (Either SomeException (EPP.ParseResult GHC.ParsedSource))
+  pure $ case r of
+    Left ex           -> Left (T.pack (show ex))
+    Right (Left _)    -> Left ("parse error in " <> T.pack fp)
+    Right (Right ps)  -> Right (HsModuleParsed ps)
 
--- | Parse Haskell source text.
---
--- Writes @src@ to a uniquely-named temporary @.hs@ file, calls 'parseHsFile',
--- then removes the temp file.  The temp file has a @.hs@ extension so that
--- GHC's parser recognises it as Haskell source.
+-- | Parse Haskell source text directly (no temp file needed).
 parseHsText :: Text -> IO (Either Text HsModule)
 parseHsText src = do
-  tmpDir <- getTemporaryDirectory
-  n <- randomRIO (0 :: Int, maxBound)
-  let fp = tmpDir </> ("DGM-hsast-" ++ show n ++ ".hs")
-  bracket
-    (System.IO.writeFile fp (T.unpack src) >> pure fp)
-    (\f -> try (removeFile f) >>= \(_ :: Either SomeException ()) -> pure ())
-    parseHsFile
+  r <- try (EPP.parseModuleFromString libdir "<SIS-input>" (T.unpack src))
+         :: IO (Either SomeException (EPP.ParseResult GHC.ParsedSource))
+  pure $ case r of
+    Left ex           -> Left (T.pack (show ex))
+    Right (Left _)    -> Left "parse error in source text"
+    Right (Right ps)  -> Right (HsModuleParsed ps)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Printing
