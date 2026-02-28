@@ -5,41 +5,34 @@
 # self-modification). Stops on any other non-zero exit (error) after
 # MAX_CONSECUTIVE_ERRORS consecutive failures.
 #
-# Usage: ./scripts/dgm-evolve.sh [--max-gen N] [extra flags passed to dgm]
+# Usage: ./scripts/dgm-evolve.sh [MAX_GEN]
+#   MAX_GEN — maximum number of generations to evolve (default: 100)
 #
 # Environment:
 #   GENERATION  — starting generation number (default: 0, auto-incremented)
-#   CABAL_BIN   — path to cabal executable (default: auto-detected)
-
-set -euo pipefail
+#   CABAL_BIN   — path to cabal executable (optional; build check skipped if absent)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
 MAX_GEN="${1:-100}"
-LOCK_FILE="/tmp/dgm-evolve.lock"
 LOG_FILE="dgm-evolve.log"
 MAX_CONSECUTIVE_ERRORS=5
 export GENERATION="${GENERATION:-0}"
 
-# Detect cabal binary
-if [ -z "${CABAL_BIN:-}" ]; then
-  if [ -x "$HOME/.ghcup/bin/cabal" ]; then
-    CABAL_BIN="$HOME/.ghcup/bin/cabal"
-  elif command -v cabal &>/dev/null; then
-    CABAL_BIN="cabal"
-  else
-    echo "[dgm-evolve] ERROR: cabal not found. Set CABAL_BIN or install via ghcup." >&2
+# ── Lock: prevent two supervisor instances (PID file, handles stale locks) ───
+
+LOCK_FILE="/tmp/dgm-evolve.pid"
+if [ -f "$LOCK_FILE" ]; then
+  OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "[dgm-evolve] Already running (PID $OLD_PID). Exiting." >&2
     exit 1
+  else
+    rm -f "$LOCK_FILE"
   fi
 fi
-
-# ── Lock: prevent two supervisor instances ───────────────────────────────────
-
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  echo "[dgm-evolve] Already running (lock: $LOCK_FILE). Exiting." >&2
-  exit 1
-fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
 # ── Logging helper ───────────────────────────────────────────────────────────
 
@@ -49,19 +42,40 @@ log() {
   echo "$msg" >> "$LOG_FILE"
 }
 
-# ── Pre-flight: build check ──────────────────────────────────────────────────
+# ── Detect cabal and run pre-flight build check (optional) ───────────────────
 
-log "Pre-flight: building DGM binary..."
-if ! "$CABAL_BIN" build 2>&1 | tee -a "$LOG_FILE" | tail -3; then
-  log "ERROR: cabal build failed. Aborting supervisor."
-  exit 1
+if [ -z "${CABAL_BIN:-}" ]; then
+  if [ -x "${HOME:-}/.ghcup/bin/cabal" ]; then
+    CABAL_BIN="$HOME/.ghcup/bin/cabal"
+  elif command -v cabal &>/dev/null; then
+    CABAL_BIN="cabal"
+  fi
 fi
-log "Build OK."
 
-# Locate the built binary
-DGM_BIN=$(find dist-newstyle -name "dgm" -type f 2>/dev/null | head -1)
-if [ -z "$DGM_BIN" ]; then
-  log "ERROR: dgm binary not found in dist-newstyle after build."
+if [ -n "${CABAL_BIN:-}" ]; then
+  log "Pre-flight: building DGM binary..."
+  if "$CABAL_BIN" build 2>&1 | tee -a "$LOG_FILE" | tail -3; then
+    log "Build OK."
+  else
+    log "ERROR: cabal build failed. Aborting supervisor."
+    exit 1
+  fi
+fi
+
+# ── Locate DGM binary (PATH preferred; dist-newstyle as fallback) ────────────
+#
+# Priority: (1) $DGM_BIN env override, (2) 'dgm' on PATH, (3) dist-newstyle.
+# This lets tests inject a mock 'dgm' via PATH without interference.
+
+if [ -z "${DGM_BIN:-}" ]; then
+  if command -v dgm &>/dev/null; then
+    DGM_BIN="dgm"
+  else
+    DGM_BIN=$(find dist-newstyle -name "dgm" -type f 2>/dev/null | head -1)
+  fi
+fi
+if [ -z "${DGM_BIN:-}" ]; then
+  log "ERROR: dgm binary not found. Build with cabal or put dgm on PATH."
   exit 1
 fi
 log "Using binary: $DGM_BIN"
@@ -77,16 +91,14 @@ while [ "$gen" -lt "$MAX_GEN" ]; do
   log "Generation $gen — running self-mod cycle..."
 
   export GENERATION=$gen
-  set +e
   "$DGM_BIN" --self-mod 1 2>&1 | tee -a "$LOG_FILE"
-  EXIT_CODE=$?
-  set -e
+  EXIT_CODE=${PIPESTATUS[0]}
 
   case $EXIT_CODE in
     42)
       gen=$((gen + 1))
       consecutive_errors=0
-      log "Improved! Now at generation $gen."
+      log "Generation $gen — evolved successfully."
       ;;
     0)
       consecutive_errors=0
