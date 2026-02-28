@@ -35,7 +35,8 @@ module DGM.SelfMod
 
 import Control.Concurrent.STM (atomically, readTVar)
 import Control.Exception (catch, IOException)
-import Control.Monad (forM)
+import Control.Concurrent.Async (mapConcurrently)
+import Control.Monad (unless)
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import qualified Data.Set as Set
@@ -113,7 +114,7 @@ proposeSelfMutations
 proposeSelfMutations st fps = do
   blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
-  perFile    <- forM fps $ \fp -> do
+  perFile    <- mapConcurrently (\fp -> do
     result <- readOwnSource fp
     case result of
       Left _  -> return []
@@ -130,11 +131,12 @@ proposeSelfMutations st fps = do
             eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests
             case eOrMut of
               Left err -> do
-                hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                  hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
                 return []
               Right om ->
                 return (filter notBlacklisted [(fp, om, m)])
-        return (oracleMuts ++ heuristicMuts)
+        return (oracleMuts ++ heuristicMuts)) fps
   return (concat perFile)
 
 -- | Sort mutation candidates for selection.

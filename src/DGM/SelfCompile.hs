@@ -11,6 +11,7 @@ module DGM.SelfCompile
   , testSelf
     -- * Scoring
   , scoreCompileResult
+  , enrichScore
     -- * Transactional rollback
   , SelfModTxn(..)
   , withSelfModTxn
@@ -93,6 +94,35 @@ scoreCompileResult (CompileSuccess passed failed _lat)
 scoreCompileResult (CompileFailure _ TypeCheckPhase) = 0.1
 scoreCompileResult (CompileFailure _ ParsePhase)     = 0.0
 scoreCompileResult (CompileFailure _ _)              = 0.05
+
+-- | Enrich a base score with additional fitness signals.
+--
+-- Takes the base score from 'scoreCompileResult' and adjusts it with:
+--
+--   * __Code-size shrink bonus__: mutations that reduce the source size
+--     receive a bonus of up to 0.05, proportional to the fraction shrunk.
+--     Helps the system prefer cleaner, smaller code over bloated alternatives.
+--
+--   * __LiquidHaskell verification bonus__: +0.02 when LH returns @"SAFE"@,
+--     since this means the mutation was formally verified.
+--
+-- The result is capped at 1.0.
+enrichScore
+  :: Double       -- ^ Base score from 'scoreCompileResult'.
+  -> Int          -- ^ Original source length in characters.
+  -> Int          -- ^ Mutated source length in characters.
+  -> Maybe Text   -- ^ LiquidHaskell result text (e.g. @"SAFE"@ or @"UNSAFE"@).
+  -> Double
+enrichScore base origLen mutLen mLhResult =
+  let shrinkRatio = if origLen <= 0
+                      then 0.0
+                      else fromIntegral (max 0 (origLen - mutLen))
+                           / fromIntegral origLen
+      sizeBonus = 0.05 * shrinkRatio
+      lhBonus   = case mLhResult of
+                    Just txt | "SAFE" `T.isInfixOf` txt -> 0.02
+                    _                                    -> 0.0
+  in  min 1.0 (base + sizeBonus + lhBonus)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Transactional rollback

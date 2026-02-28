@@ -46,6 +46,7 @@ module DGM.AbsoluteZero
   ) where
 
 import Control.Exception (catch, IOException)
+import Control.Monad (unless)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.IO (hPutStrLn, stderr)
@@ -368,8 +369,9 @@ oracleGoalFor targetMod = do
           eResult <- proposeMutation env modPath src []
           case eResult of
             Left err -> do
-              hPutStrLn stderr ("DGM.AbsoluteZero: oracle error for "
-                                ++ T.unpack targetMod ++ ": " ++ T.unpack err)
+              unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                hPutStrLn stderr ("DGM.AbsoluteZero: oracle error for "
+                                  ++ T.unpack targetMod ++ ": " ++ T.unpack err)
               return (AddDynamicRule "fmap-increment")
             Right mut ->
               -- Every third oracle response targets the dynamic rule set.
