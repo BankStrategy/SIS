@@ -183,6 +183,7 @@ executable dgm
   build-depends:
       base
     , dgm-haskell
+    , containers
     , text
     , stm
     , directory  >= 1.3

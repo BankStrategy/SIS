@@ -20,6 +20,7 @@ import Control.Exception (bracket)
 import Control.Monad (replicateM, when)
 import Data.IORef (newIORef)
 import Data.Text (Text)
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import System.Directory (getCurrentDirectory)
 import System.Environment (getArgs, lookupEnv)
@@ -72,6 +73,7 @@ main = do
   repoRoot <- getCurrentDirectory
   let bootstrapNode = exprToASTNode "root" bootstrapExpr
   st <- newAgentStateWithRoot bootstrapNode repoRoot
+  atomically $ writeTVar (stateGeneration st) genNum
 
   -- Initialise audit log.
   auditLog <- newIORef []
@@ -84,6 +86,12 @@ main = do
     atomically $ writeTVar (stateArchive st) prior
     when (not (null prior)) $
       putStrLn $ "Loaded " <> show (length prior) <> " entries from archive.\n"
+
+    priorBlacklist <- loadBlacklist hdl
+    atomically $ writeTVar (stateMutationBlacklist st)
+      (Set.fromList priorBlacklist)
+    when (not (null priorBlacklist)) $
+      putStrLn $ "Loaded " <> show (length priorBlacklist) <> " blacklisted mutations.\n"
 
     -- Build cycle configuration; inject goal if provided.
     cfg0 <- defaultCycleConfig st auditLog hdl

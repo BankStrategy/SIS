@@ -56,7 +56,7 @@ import DGM.AbsoluteZero
 import DGM.Evolution
 
 import DGM.Sandbox (runExprInSandbox, defaultSandboxConfig, SandboxResult(..))
-import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flushArchive)
+import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flushArchive, flushBlacklist)
 import DGM.SafetyKernel
 import qualified DGM.Archive as Archive
 
@@ -312,6 +312,7 @@ runSelfModCycle cfg = do
           -- Blacklist inapplicable mutations too so they are not re-proposed.
           atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
             (Set.insert (fp, hmDescription mut))
+          flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
           pure [step1, step2, step3]
 
         Right mutModule -> do
@@ -420,6 +421,7 @@ runSelfModCycle cfg = do
               -- Blacklist this (file, mutation) pair so it is not re-proposed.
               atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
                 (Set.insert (fp, hmDescription mut))
+              flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
               let step6 = step6Desc False
                             ("Rollback complete | score=" <> T.pack (show score))
               emit cfg step6
@@ -435,7 +437,8 @@ runSelfModCycle cfg = do
                             ("Score: " <> T.pack (show score) <> " (all tests pass)")
               emit cfg step5
               -- Create archive entry with full provenance.
-              entry <- mkSelfModEntry (hmDescription mut) fp score True mLhText mSbvText oracleModel
+              gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
+              entry <- mkSelfModEntry gen (hmDescription mut) fp score True mLhText mSbvText oracleModel
               -- Commit the mutation to git.
               commitResult <- commitMutation fp mut entry
               let step6 = case commitResult of
@@ -451,6 +454,7 @@ runSelfModCycle cfg = do
               -- Archive the entry regardless of commit outcome — tests passed.
               atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
               flushArchive (ccArchiveHandle cfg) [entry]
+              atomically $ modifyTVar' (stateGeneration (ccAgentState cfg)) (+1)
               -- ── Hint sub-step: propose + evaluate dynamic rule ─────────────
               hintSteps <- runHintSubStep cfg
               pure ([step1, step2, step3, step4, step4b, step5, step6] ++ hintSteps)
@@ -602,12 +606,13 @@ archiveSuccess cfg result = do
 
 archiveSelfModFailed :: CycleConfig -> Text -> FilePath -> Double -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
 archiveSelfModFailed cfg desc fp score mLh mSbv mOracle = do
-  entry <- mkSelfModEntry desc fp score False mLh mSbv mOracle
+  gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
+  entry <- mkSelfModEntry gen desc fp score False mLh mSbv mOracle
   atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
   flushArchive (ccArchiveHandle cfg) [entry]
 
-mkSelfModEntry :: Text -> FilePath -> Double -> Bool -> Maybe Text -> Maybe Text -> Maybe Text -> IO ArchiveEntry
-mkSelfModEntry desc fp score passed mLh mSbv mOracle = do
+mkSelfModEntry :: Int -> Text -> FilePath -> Double -> Bool -> Maybe Text -> Maybe Text -> Maybe Text -> IO ArchiveEntry
+mkSelfModEntry gen desc fp score passed mLh mSbv mOracle = do
   n <- randomRIO (0 :: Int, maxBound)
   let eid = "selfmod-" <> T.pack (show n)
       mut = Mutation
@@ -622,7 +627,7 @@ mkSelfModEntry desc fp score passed mLh mSbv mOracle = do
     , entryParentId     = Nothing
     , entryScore        = score
     , entryPassed       = passed
-    , entryGeneration   = 0
+    , entryGeneration   = gen
     , entryCounterEx    = Nothing
     , entryLiquidResult = mLh
     , entrySbvResult    = mSbv

@@ -24,6 +24,8 @@ module DGM.Archive
   , closeArchive
   , flushArchive
   , loadArchive
+  , flushBlacklist
+  , loadBlacklist
     -- * Serialisation
   , archiveToJSON
   , jsonToArchive
@@ -166,9 +168,13 @@ jsonToArchive = decode
 --
 -- Carries callbacks so that 'Cycle' code never needs to import SQLite directly.
 data ArchiveHandle = ArchiveHandle
-  { ahFlush :: [ArchiveEntry] -> IO ()
-  , ahLoad  :: IO [ArchiveEntry]
-  , ahClose :: IO ()
+  { ahFlush          :: [ArchiveEntry] -> IO ()
+  , ahLoad           :: IO [ArchiveEntry]
+  , ahClose          :: IO ()
+  , ahFlushBlacklist :: [(FilePath, Text)] -> IO ()
+    -- ^ Persist (filePath, mutationDesc) pairs that have failed.
+  , ahLoadBlacklist  :: IO [(FilePath, Text)]
+    -- ^ Load all persisted blacklist entries on startup.
   }
 
 -- | Open an archive handle for the given backend.
@@ -177,26 +183,33 @@ data ArchiveHandle = ArchiveHandle
 -- is created if it does not already exist and the handle owns the connection.
 openArchive :: ArchiveBackend -> IO ArchiveHandle
 openArchive InMemory = pure ArchiveHandle
-  { ahFlush = \_ -> pure ()
-  , ahLoad  = pure []
-  , ahClose = pure ()
+  { ahFlush          = \_ -> pure ()
+  , ahLoad           = pure []
+  , ahClose          = pure ()
+  , ahFlushBlacklist = \_ -> pure ()
+  , ahLoadBlacklist  = pure []
   }
 #ifdef WITH_SQLITE
 openArchive (SQLiteBacked path) = do
   conn <- SQL.open path
   SQL.execute_ conn sqlCreateTable
+  SQL.execute_ conn sqlCreateBlacklistTable
   pure ArchiveHandle
-    { ahFlush = sqlFlush conn
-    , ahLoad  = sqlLoad conn
-    , ahClose = SQL.close conn
+    { ahFlush          = sqlFlush conn
+    , ahLoad           = sqlLoad conn
+    , ahClose          = SQL.close conn
+    , ahFlushBlacklist = sqlFlushBlacklist conn
+    , ahLoadBlacklist  = sqlLoadBlacklist conn
     }
 #else
 openArchive (SQLiteBacked _) = do
   putStrLn "Warning: SQLite support not compiled in; falling back to in-memory archive"
   pure ArchiveHandle
-    { ahFlush = \_ -> pure ()
-    , ahLoad  = pure []
-    , ahClose = pure ()
+    { ahFlush          = \_ -> pure ()
+    , ahLoad           = pure []
+    , ahClose          = pure ()
+    , ahFlushBlacklist = \_ -> pure ()
+    , ahLoadBlacklist  = pure []
     }
 #endif
 
@@ -211,6 +224,14 @@ flushArchive = ahFlush
 -- | Load all persisted entries from storage.
 loadArchive :: ArchiveHandle -> IO [ArchiveEntry]
 loadArchive = ahLoad
+
+-- | Persist a batch of (filePath, mutationDesc) blacklist entries.
+flushBlacklist :: ArchiveHandle -> [(FilePath, Text)] -> IO ()
+flushBlacklist = ahFlushBlacklist
+
+-- | Load all persisted blacklist entries from storage.
+loadBlacklist :: ArchiveHandle -> IO [(FilePath, Text)]
+loadBlacklist = ahLoadBlacklist
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SQLite implementation (compiled only when WITH_SQLITE is defined)
@@ -259,5 +280,22 @@ sqlLoad conn = do
       , entrySbvResult    = Nothing
       , entryOracleModel  = Nothing
       }
+
+sqlCreateBlacklistTable :: SQL.Query
+sqlCreateBlacklistTable =
+  "CREATE TABLE IF NOT EXISTS mutation_blacklist (file_path TEXT NOT NULL, mutation_desc TEXT NOT NULL, PRIMARY KEY (file_path, mutation_desc))"
+
+sqlFlushBlacklist :: SQL.Connection -> [(FilePath, Text)] -> IO ()
+sqlFlushBlacklist conn pairs = SQL.withTransaction conn $
+  mapM_ (\(fp, desc) ->
+    SQL.execute conn
+      "INSERT OR IGNORE INTO mutation_blacklist (file_path, mutation_desc) VALUES (?,?)"
+      (fp, desc)) pairs
+
+sqlLoadBlacklist :: SQL.Connection -> IO [(FilePath, Text)]
+sqlLoadBlacklist conn = do
+  rows <- SQL.query_ conn
+    "SELECT file_path, mutation_desc FROM mutation_blacklist"
+  pure rows
 
 #endif
