@@ -349,15 +349,18 @@ instance FromJSON ArchiveEntry where
 -- Every mutable field is a 'TVar' so that the 'DGM.SafetyKernel.transact'
 -- primitive can snapshot and roll back in O(1) time via STM (SPEC.md §3.2).
 data AgentState = AgentState
-  { stateGeneration :: TVar Int
-  , stateArchive    :: TVar [ArchiveEntry]
-  , stateCurrentAST :: TVar ASTNode
-  , stateStateMap   :: TVar (Map Text Text)  -- ^ Named slots for StateUpdate.
-  , stateMetrics    :: TVar Metrics
-  , stateRunning    :: TVar Bool
-  , stateRepoRoot   :: FilePath              -- ^ Root directory of the project; used to whitelist SystemWrite paths.
-  , stateTypesHash  :: TVar Text             -- ^ SHA-256 of @Types.hs@ at last cycle start; 'Text' empty = not yet recorded.
-  , stateSbvQueue   :: TVar [CounterExample] -- ^ Counter-examples from SBV; consumed by the ExprPhase as endogenous ExprTasks.
+  { stateGeneration        :: TVar Int
+  , stateArchive           :: TVar [ArchiveEntry]
+  , stateCurrentAST        :: TVar ASTNode
+  , stateStateMap          :: TVar (Map Text Text)  -- ^ Named slots for StateUpdate.
+  , stateMetrics           :: TVar Metrics
+  , stateRunning           :: TVar Bool
+  , stateRepoRoot          :: FilePath              -- ^ Root directory of the project; used to whitelist SystemWrite paths.
+  , stateTypesHash         :: TVar Text             -- ^ SHA-256 of @Types.hs@ at last cycle start; 'Text' empty = not yet recorded.
+  , stateSbvQueue          :: TVar [CounterExample] -- ^ Counter-examples from SBV; consumed by the ExprPhase as endogenous ExprTasks.
+  , stateMutationBlacklist :: TVar (Set (FilePath, Text))
+    -- ^ Pairs of @(filePath, mutationDescription)@ that have already been tried
+    -- and failed.  'proposeSelfMutations' filters these out to avoid looping.
   }
 
 -- | Allocate a fresh 'AgentState' with a minimal bootstrap AST.
@@ -374,18 +377,20 @@ newAgentStateWithRoot bootstrapAST repoRoot = atomically $ do
   sm  <- newTVar Map.empty
   met <- newTVar initialMetrics
   run <- newTVar True
-  th  <- newTVar ""   -- typesHash: empty until first cycle checks Types.hs
-  sq  <- newTVar []   -- sbvQueue: populated when SBV finds counter-examples
+  th  <- newTVar ""         -- typesHash: empty until first cycle checks Types.hs
+  sq  <- newTVar []         -- sbvQueue: populated when SBV finds counter-examples
+  bl  <- newTVar Set.empty  -- mutationBlacklist: grows as mutations fail
   pure AgentState
-    { stateGeneration = g
-    , stateArchive    = arc
-    , stateCurrentAST = ast
-    , stateStateMap   = sm
-    , stateMetrics    = met
-    , stateRunning    = run
-    , stateRepoRoot   = repoRoot
-    , stateTypesHash  = th
-    , stateSbvQueue   = sq
+    { stateGeneration        = g
+    , stateArchive           = arc
+    , stateCurrentAST        = ast
+    , stateStateMap          = sm
+    , stateMetrics           = met
+    , stateRunning           = run
+    , stateRepoRoot          = repoRoot
+    , stateTypesHash         = th
+    , stateSbvQueue          = sq
+    , stateMutationBlacklist = bl
     }
 
 -- ─────────────────────────────────────────────────────────────────────────────

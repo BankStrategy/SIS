@@ -33,10 +33,12 @@ module DGM.SelfMod
   , commitMessage
   ) where
 
+import Control.Concurrent.STM (atomically, readTVar)
 import Control.Exception (catch, IOException)
 import Control.Monad (forM)
 import Data.List (sortBy)
 import Data.Ord (comparing)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -108,23 +110,30 @@ proposeSelfMutations
   :: AgentState
   -> [FilePath]
   -> IO [(FilePath, HsMutation, HsModule)]
-proposeSelfMutations _st fps = do
+proposeSelfMutations st fps = do
+  blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
   perFile    <- forM fps $ \fp -> do
     result <- readOwnSource fp
     case result of
       Left _  -> return []
       Right m -> do
-        let heuristicMuts = [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
+        let notBlacklisted (f, mut, _) =
+              (f, hmDescription mut) `Set.notMember` blacklist
+            heuristicMuts = filter notBlacklisted
+              [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
         oracleMuts <- case mOracleEnv of
           Nothing  -> return []
           Just env -> do
             let src   = printHsModule m
                 tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
             eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests
-            return $ case eOrMut of
-              Left  _   -> []
-              Right om  -> [(fp, om, m)]
+            case eOrMut of
+              Left err -> do
+                hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                return []
+              Right om ->
+                return (filter notBlacklisted [(fp, om, m)])
         return (oracleMuts ++ heuristicMuts)
   return (concat perFile)
 

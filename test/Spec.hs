@@ -690,19 +690,22 @@ cleanupDb path = removeFile path `catch` \e ->
 -- DGM.HsAST tests (only compiled with -f+with-exactprint)
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- | A small Haskell source fixture with known eta-reducible definitions.
+-- | A small Haskell source fixture with a known unused explicit import.
 --
 -- Used to test 'collectHsMutations' and 'applyHsMutation' without depending
--- on the exact content of production source files.
+-- on the exact content of production source files.  The @sort@ import is
+-- unused so 'unusedImportRule' will flag it for removal.
 hsASTFixture :: Text
 hsASTFixture = T.unlines
   [ "module TestMutate where"
   , ""
-  , "-- | Reverse a list (eta-reducible)."
+  , "import Data.List (sort)"
+  , ""
+  , "-- | Reverse a list."
   , "reverseList :: [a] -> [a]"
   , "reverseList xs = reverse xs"
   , ""
-  , "-- | Map a function over a list (eta-reducible)."
+  , "-- | Map a function over a list."
   , "applyAll :: (a -> b) -> [a] -> [b]"
   , "applyAll f xs = map f xs"
   ]
@@ -827,7 +830,7 @@ selfModTests = testGroup "DGM.SelfMod"
       createDirectoryIfMissing True srcDGMDir
       -- Write a minimal Haskell fixture to the temp DGM dir.
       let target      = srcDGMDir </> "Fixture.hs"
-          origContent = "module Fixture where\n\nfixId :: a -> a\nfixId x = id x\n"
+          origContent = "module Fixture where\n\nimport Data.List (sort)\n\nfixId :: a -> a\nfixId x = id x\n"
       writeFile target origContent
       -- Parse and collect mutations.
       parseResult <- parseHsFile target

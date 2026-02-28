@@ -199,13 +199,11 @@ collectHsMutations rules m =
 
 -- | Conservative rule set for Phase B self-modification.
 --
--- Includes eta-reduction and unused-import removal.  No rules that change
--- type signatures or introduce new definitions.
+-- Only includes unused-import removal.  The eta-reduce heuristic was removed
+-- because text-level word-splitting cannot preserve multi-equation definitions,
+-- guards, or operator sections — it produces incorrect code.
 defaultHsRules :: HsRuleSet
-defaultHsRules =
-  [ etaReduceRule
-  , unusedImportRule
-  ]
+defaultHsRules = [unusedImportRule]
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule: eta-reduction
@@ -279,20 +277,21 @@ unusedImportRule = HsMutation
 
 unusedImportTransform :: Text -> Either Text Text
 unusedImportTransform src =
-  let ls       = T.lines src
-      -- Separate import block from the rest of the file.
-      (pre, rest) = break (not . isImportOrBlank) ls
-      body       = T.unlines rest
-      -- Identify import lines that have explicit lists where none of the
+  let ls          = T.lines src
+      -- Collect all import lines regardless of position (the module declaration
+      -- precedes imports, so a prefix-based split would find nothing).
+      importLines = filter isImportLine ls
+      -- Body: everything that is not an import line (module decl, definitions).
+      body        = T.unlines (filter (not . isImportLine) ls)
+      -- Identify import lines with explicit lists where none of the
       -- listed names appears in the body.
-      toRemove   = filter (isUnusedExplicitImport body) pre
+      toRemove    = filter (isUnusedExplicitImport body) importLines
   in  if null toRemove
       then Left "no unused explicit imports detected"
       else Right $ T.unlines $ filter (`notElem` toRemove) ls
   where
-    isImportOrBlank :: Text -> Bool
-    isImportOrBlank l =
-      T.null (T.strip l) || "import " `T.isPrefixOf` T.stripStart l
+    isImportLine :: Text -> Bool
+    isImportLine l = "import " `T.isPrefixOf` T.stripStart l
 
     -- | True if this line is an explicit import (@import M (names)@) AND
     -- none of the listed bare names appear in the file body.

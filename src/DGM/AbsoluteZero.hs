@@ -48,8 +48,10 @@ module DGM.AbsoluteZero
 import Control.Exception (catch, IOException)
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.IO (hPutStrLn, stderr)
 import qualified Data.Text.IO as TIO
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
 import qualified Data.Set as Set
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
@@ -229,6 +231,7 @@ data Proposer = Proposer
   , propExplorationRate   :: Double        -- ^ How far beyond frontier to explore.
   , propCurrentPhase      :: ProposerPhase -- ^ Current operating mode.
   , propSelfModCounter    :: Int           -- ^ ExprPhase cycles since last SelfModPhase.
+  , propSolvedTasks       :: Set Text      -- ^ Task IDs already solved; avoids re-proposing.
   }
 
 defaultProposer :: Proposer
@@ -237,6 +240,7 @@ defaultProposer = Proposer
   , propExplorationRate   = 0.15
   , propCurrentPhase      = ExprMode
   , propSelfModCounter    = 0
+  , propSolvedTasks       = Set.empty
   }
 
 -- | Propose a task and return the updated 'Proposer'.
@@ -250,18 +254,41 @@ proposeTask p
 
 -- | Propose an expression task at the agent's current Pareto frontier.
 --
--- Increments 'propSelfModCounter' so that 'runCycleN' can trigger phase
--- transitions at the 'ccSelfModRateLimit' cadence.
+-- Filters out already-solved tasks so the Proposer never loops on the same
+-- task.  When the entire library is exhausted, generates a fresh arithmetic
+-- task procedurally.  Increments 'propSelfModCounter' so that 'runCycleN'
+-- can trigger phase transitions at the 'ccSelfModRateLimit' cadence.
 proposeExprTask :: Proposer -> IO (Task, Proposer)
 proposeExprTask prop = do
   let target = propCurrentDifficulty prop + propExplorationRate prop
+      solved = propSolvedTasks prop
+      avail  = filter (\(_, t) -> taskId t `Set.notMember` solved) taskLibrary
   noise <- randomRIO (-0.05, 0.05)
-  let best    = pickNearest (target + noise) taskLibrary
-      newProp = prop { propSelfModCounter = propSelfModCounter prop + 1 }
-  pure (best, newProp)
+  task <- if null avail
+            then generateProceduralTask (target + noise)
+            else pure (pickNearest (target + noise) avail)
+  let newProp = prop { propSelfModCounter = propSelfModCounter prop + 1 }
+  pure (task, newProp)
   where
     pickNearest t tasks =
       snd $ foldr1 (\a b -> if abs (fst a - t) < abs (fst b - t) then a else b) tasks
+
+-- | Generate a fresh arithmetic simplification task procedurally.
+--
+-- Used when the static task library is exhausted (all tasks solved).
+-- Produces a unique task ID so the Proposer can track it in 'propSolvedTasks'.
+generateProceduralTask :: TaskDifficulty -> IO Task
+generateProceduralTask diff = do
+  a     <- randomRIO (1, 20 :: Int)
+  b     <- randomRIO (1, 20 :: Int)
+  opIdx <- randomRIO (0, 1 :: Int)
+  let op   = if (opIdx :: Int) == 0 then "+" else "*"
+      expr = binop op (lit a) (lit b)
+      base = simplifyTask expr
+  pure base
+    { taskId         = "proc-" <> T.pack (show a) <> op <> T.pack (show b)
+    , taskDifficulty = diff
+    }
 
 -- | Propose a self-modification task targeting the live module graph.
 --
@@ -326,24 +353,27 @@ oracleGoalFor targetMod = do
   mEnv <- newOracleEnv
   case mEnv of
     Nothing  ->
-      -- No oracle: alternate between static and dynamic rule goals.
-      if roll == 0
-        then return (AddDynamicRule "fmap-increment")
-        else return (AddRewriteRule "etaReduce")
+      -- No oracle available: use dynamic rule goal as safe fallback.
+      return (AddDynamicRule "fmap-increment")
     Just env -> do
       let modPath = "src" </> T.unpack (T.replace "." "/" targetMod) <> ".hs"
       exists <- doesFileExist modPath
       if not exists
-        then return (AddRewriteRule "etaReduce")
+        then do
+          hPutStrLn stderr ("DGM.AbsoluteZero: module file not found: " ++ modPath)
+          return (AddDynamicRule "fmap-increment")
         else do
           src <- TIO.readFile modPath
                    `catch` (\(_ :: IOException) -> return "")
           eResult <- proposeMutation env modPath src []
-          return $ case eResult of
-            Left  _   -> AddRewriteRule "etaReduce"
+          case eResult of
+            Left err -> do
+              hPutStrLn stderr ("DGM.AbsoluteZero: oracle error for "
+                                ++ T.unpack targetMod ++ ": " ++ T.unpack err)
+              return (AddDynamicRule "fmap-increment")
             Right mut ->
               -- Every third oracle response targets the dynamic rule set.
-              if roll == 0
+              return $ if roll == 0
                 then AddDynamicRule (hmDescription mut)
                 else AddRewriteRule (hmDescription mut)
 
@@ -441,19 +471,28 @@ defaultSelfPlayConfig = SelfPlayConfig
 
 -- | Run one Absolute Zero self-play step.
 --
--- Returns the updated @Proposer@ (with adapted difficulty estimate and
--- incremented 'propSelfModCounter') and the full @SolverResult@.
+-- Returns the updated @Proposer@ (with adapted difficulty estimate,
+-- incremented 'propSelfModCounter', and the solved task recorded) and
+-- the full @SolverResult@.
 runSelfPlayStep :: SelfPlayConfig -> IO (Proposer, SolverResult)
 runSelfPlayStep cfg = do
   (task, prop') <- proposeTask (spProposer cfg)
   result <- solveTask task
   let acc    = accuracyReward result
       cap    = propCurrentDifficulty prop'
-      -- Adapt: if we solved it easily, raise the difficulty estimate.
-      -- If we failed, lower it slightly.
+      -- Adapt: if solved, raise difficulty.  If failed, lower slightly.
+      -- Partial credit (0 < acc < 1) gives a proportional gradient rather
+      -- than freezing the difficulty estimate.
       newCap
         | acc >= 1.0 = min 1.0 (cap + spAdaptRate cfg)
         | acc <= 0.0 = max 0.0 (cap - spAdaptRate cfg * 0.5)
-        | otherwise  = cap
-      newProp = prop' { propCurrentDifficulty = newCap }
+        | otherwise  = cap + (acc - 0.5) * spAdaptRate cfg
+      -- Record solved tasks so they are not re-proposed.
+      newSolved
+        | acc >= 1.0 = Set.insert (taskId task) (propSolvedTasks prop')
+        | otherwise  = propSolvedTasks prop'
+      newProp = prop'
+        { propCurrentDifficulty = newCap
+        , propSolvedTasks       = newSolved
+        }
   pure (newProp, result)

@@ -34,6 +34,7 @@ import qualified Control.Exception as Control.Exception
 import Control.Exception (SomeException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import qualified Data.Set as Set
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -413,6 +414,9 @@ runSelfModCycle cfg = do
               let step5 = step5Desc False ("Score: " <> T.pack (show score))
               emit cfg step5
               archiveSelfModFailed cfg (hmDescription mut) fp score mLhText mSbvText oracleModel
+              -- Blacklist this (file, mutation) pair so it is not re-proposed.
+              atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+                (Set.insert (fp, hmDescription mut))
               let step6 = step6Desc False
                             ("Rollback complete | score=" <> T.pack (show score))
               emit cfg step6
