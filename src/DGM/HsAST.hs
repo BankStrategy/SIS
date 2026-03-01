@@ -39,6 +39,8 @@ module DGM.HsAST
   , limitedEtaReduceTransform
   , simplifyIfRule
   , simplifyIfTransform
+    -- * Text-only module construction
+  , mkTextModule
   ) where
 
 import Data.Text (Text)
@@ -129,6 +131,14 @@ parseHsText src = do
 printHsModule :: HsModule -> Text
 printHsModule (HsModuleParsed ps)  = T.pack (EP.exactPrint ps)
 printHsModule (HsModuleMutated t)  = t
+
+-- | Construct a text-only 'HsModule' without parsing.
+--
+-- Use this for files that cannot be parsed by ghc-exactprint (e.g. CPP files).
+-- The resulting module supports 'printHsModule' and 'applyHsMutation' via
+-- text-level transforms, but 'hsNodes' will use text-level heuristics.
+mkTextModule :: Text -> HsModule
+mkTextModule = HsModuleMutated
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Traversal
@@ -622,7 +632,9 @@ simplifyIfTransform src =
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- | Opaque stub — exactprint backend disabled at build time.
-data HsModule = HsModule deriving (Show, Eq)
+--
+-- 'HsModuleText' carries raw source text for Oracle text-level mutations.
+data HsModule = HsModule | HsModuleText !Text deriving (Show, Eq)
 
 -- | A node in the Haskell source — stub.
 data HsNode = HsNode
@@ -651,9 +663,10 @@ parseHsFile _ = pure $ Left stubMsg
 parseHsText :: Text -> IO (Either Text HsModule)
 parseHsText _ = pure $ Left stubMsg
 
--- | Returns empty text for the stub module.
+-- | Returns empty text for the stub module, or the stored text for 'HsModuleText'.
 printHsModule :: HsModule -> Text
-printHsModule _ = ""
+printHsModule HsModule        = ""
+printHsModule (HsModuleText t) = t
 
 -- | Returns no nodes for the stub module.
 hsNodes :: HsModule -> [HsNode]
@@ -663,9 +676,17 @@ hsNodes _ = []
 hsNodeText :: HsNode -> Text
 hsNodeText = hnText
 
--- | Always returns @'Left'@ when exactprint is not compiled in.
+-- | Applies a mutation via text transform for 'HsModuleText'; always fails for 'HsModule'.
 applyHsMutation :: HsMutation -> HsModule -> Either Text HsModule
-applyHsMutation _ _ = Left stubMsg
+applyHsMutation _ HsModule = Left stubMsg
+applyHsMutation mut (HsModuleText src) =
+  case hmTransform mut src of
+    Left err -> Left err
+    Right t  -> Right (HsModuleText t)
+
+-- | Construct a text-only 'HsModule' without parsing.
+mkTextModule :: Text -> HsModule
+mkTextModule = HsModuleText
 
 -- | Returns an empty list for the stub module.
 collectHsMutations :: HsRuleSet -> HsModule -> [HsMutation]

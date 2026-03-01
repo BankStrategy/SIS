@@ -68,6 +68,7 @@ verifyWithLiquid :: FilePath  -- ^ Repository root (working directory for cabal)
 verifyWithLiquid repoRoot mutatedFile = do
   let target  = fileToTarget mutatedFile
       args    = [ "build"
+                , "--with-compiler=" ++ ghcBin
                 , "-f+with-liquid"
                 , "--ghc-options=-fplugin LiquidHaskell"
                 , target
@@ -76,7 +77,7 @@ verifyWithLiquid repoRoot mutatedFile = do
       env     = Just [("HOME", "/Users/raz"), ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]
   hPutStrLn stderr ("DGM.Liquid: verifyWithLiquid " ++ mutatedFile)
   result <- timeout liquidTimeoutMicros $
-    try (readProcessWithExitCode "cabal" args "" :: IO (ExitCode, String, String))
+    try (readProcessWithExitCode cabalBin args "" :: IO (ExitCode, String, String))
   case result of
     Nothing ->
       return (LiquidError "LiquidHaskell verification timed out (120s)")
@@ -103,6 +104,12 @@ fileToTarget fp =
 -- | 120 seconds in microseconds.
 liquidTimeoutMicros :: Int
 liquidTimeoutMicros = 120 * 1000 * 1000
+
+cabalBin :: FilePath
+cabalBin = "/Users/raz/.ghcup/bin/cabal"
+
+ghcBin :: FilePath
+ghcBin = "/Users/raz/.ghcup/bin/ghc-9.6.7"
 
 #else
 

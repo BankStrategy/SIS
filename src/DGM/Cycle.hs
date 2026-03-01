@@ -71,7 +71,6 @@ import DGM.Rewriting (DynamicRule(..), applyDynamicRules)
 import DGM.HintBridge (HintEnv, newHintEnv, evalRuleCandidate)
 import DGM.Oracle (newOracleEnv, MutationContext(..))
 import DGM.OracleContext (collectGhcWarnings)
-import DGM.Verification (verifyEquivalence, EquivSpec(..))
 import DGM.RuleMiner (minePatterns, boostByFile, evictStaleRules)
 import DGM.NatLang (EvolutionGoal, applyGoal, describeGoal)
 
@@ -317,7 +316,7 @@ runSelfModCycle cfg = do
         ((_, mut, _) : _)
           | "oracle-diff: " `T.isPrefixOf` hmDescription mut ->
               ( "oracle proposed: " <> T.take 40 (T.drop 13 (hmDescription mut))
-              , Just "google/gemini-flash-1.5-8b" )
+              , Just "google/gemini-3-flash-preview" )
           | otherwise ->
               ( "heuristic: " <> T.take 40 (hmDescription mut)
               , Nothing )
@@ -445,34 +444,19 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
               LiquidError msg ->
                 return (Left ("LiquidHaskell error: " <> msg))
               LiquidSafe -> do
-                -- ── SBV equivalence check (pillar II formal verification) ─
-                let spec = EquivSpec
-                             { esName          = "selfmod-equiv"
-                             , esOriginal      = bootstrapExpr
-                             , esMutated       = bootstrapExpr
-                             , esInputDomain   = []
-                             , esSymbolicBound = 0
-                             }
-                sbvResult <- verifyEquivalence spec
-                let sbvText = case sbvResult of
-                      Verified _    -> "QED"
-                      Falsifiable _ -> "Falsifiable"
-                      VTimeout    _ -> "Timeout"
-                writeIORef sbvRef (Just sbvText)
-                case sbvResult of
-                  Falsifiable ce -> do
-                    atomically (modifyTVar' (stateSbvQueue st) (ce:))
-                    return (Left "SBV Falsifiable: counter-example enqueued")
-                  VTimeout msg ->
-                    return (Left ("SBV timeout: " <> msg))
-                  Verified _ -> do
-                    cr <- testSelf
-                    let base = scoreCompileResult cr
-                        sc   = enrichScore base origLen mutLen (Just lhText)
-                    writeIORef scoreRef sc
-                    if sc >= 1.0
-                      then return (Right ())
-                      else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
+                -- SBV equivalence is skipped for source-level mutations:
+                -- there is no ExprF representation to compare, so the check
+                -- would be vacuous (comparing bootstrapExpr to itself).
+                -- SBV remains active for ExprPhase cycles where it has real
+                -- original vs. mutated expressions.
+                writeIORef sbvRef (Just "skipped (source-level)")
+                cr <- testSelf
+                let base = scoreCompileResult cr
+                    sc   = enrichScore base origLen mutLen (Just lhText)
+                writeIORef scoreRef sc
+                if sc >= 1.0
+                  then return (Right ())
+                  else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
 
   score   <- readIORef scoreRef
   mLhText <- readIORef lhRef
@@ -764,7 +748,7 @@ checkTypesHash st = do
             -- Best-effort type-check: run cabal build (ignoring errors here;
             -- the next compile via testSelf will surface any failures).
             _ <- try (System.Process.readProcessWithExitCode
-                        "cabal" ["build"] "") :: IO (Either SomeException (ExitCode, String, String))
+                        cabalBin ["build", "--with-compiler=" ++ ghcBin] "") :: IO (Either SomeException (ExitCode, String, String))
             atomically (writeTVar (stateTypesHash st) newHash)
           else return ()
   where
@@ -792,6 +776,16 @@ showCE :: CounterExample -> Text
 showCE ce = "input=" <> T.pack (show (ceInputs ce))
           <> " expected=" <> ceExpected ce
           <> " actual=" <> ceActual ce
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Configuration
+-- ─────────────────────────────────────────────────────────────────────────────
+
+cabalBin :: FilePath
+cabalBin = "/Users/raz/.ghcup/bin/cabal"
+
+ghcBin :: FilePath
+ghcBin = "/Users/raz/.ghcup/bin/ghc-9.6.7"
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Generation model helpers

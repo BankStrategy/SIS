@@ -120,50 +120,53 @@ proposeSelfMutations st fps mCtx modGraph warnings = do
   perFile    <- mapM (\fp -> do
     -- Read raw source first, then parse from text to avoid GHC API file locks.
     src <- TIO.readFile fp
-    -- Skip CPP files: ghc-exactprint cannot parse #ifdef/#endif directives.
-    if "{-# LANGUAGE CPP #-}" `T.isInfixOf` src
-      then return []
-      else do
-        result <- parseHsText src
-        case result of
-          Left err -> do
-            hPutStrLn stderr ("DGM.SelfMod: parse error in " ++ fp ++ ": " ++ T.unpack err)
-            return []
-          Right m -> do
-            let notBlacklisted (f, mut, _) =
-                  (f, hmDescription mut) `Set.notMember` blacklist
-                heuristicMuts = filter notBlacklisted
-                  [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
-            oracleMuts <- case mOracleEnv of
-              Nothing  -> return []
-              Just env -> do
-                -- Build module context for enriched prompting.
-                let modCtx = buildModuleContext modGraph warnings fp src
-                    mEnrichedPrompt = buildEnrichedPrompt modCtx mCtx
-                case mEnrichedPrompt of
-                  -- GHC warnings available: use enriched prompt path.
-                  Just enrichedPrompt -> do
-                    eOrMut <- withOracle env $ \h ->
-                      proposeMutationEnrichedH h fp src enrichedPrompt
-                    case eOrMut of
-                      Left err -> do
-                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
-                          hPutStrLn stderr ("DGM.SelfMod: oracle-enriched error for " ++ fp ++ ": " ++ T.unpack err)
-                        return []
-                      Right om ->
-                        return (filter notBlacklisted [(fp, om, m)])
-                  -- No warnings for this file: fall back to standard prompt.
-                  Nothing -> do
-                    let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
-                    eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
-                    case eOrMut of
-                      Left err -> do
-                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
-                          hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
-                        return []
-                      Right om ->
-                        return (filter notBlacklisted [(fp, om, m)])
-            return (oracleMuts ++ heuristicMuts)) fps
+    let isCPP = "{-# LANGUAGE CPP #-}" `T.isInfixOf` src
+    -- CPP files: use mkTextModule (ghc-exactprint can't parse #ifdef/#endif).
+    -- Non-CPP files: full parse via ghc-exactprint.
+    mModule <- if isCPP
+                 then return (Right (mkTextModule src))
+                 else parseHsText src
+    case mModule of
+      Left err -> do
+        hPutStrLn stderr ("DGM.SelfMod: parse error in " ++ fp ++ ": " ++ T.unpack err)
+        return []
+      Right m -> do
+        let notBlacklisted (f, mut, _) =
+              (f, hmDescription mut) `Set.notMember` blacklist
+            -- Heuristic mutations need a parsed AST; skip for CPP files.
+            heuristicMuts = if isCPP then [] else
+              filter notBlacklisted
+                [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
+        oracleMuts <- case mOracleEnv of
+          Nothing  -> return []
+          Just env -> do
+            -- Build module context for enriched prompting.
+            let modCtx = buildModuleContext modGraph warnings fp src
+                mEnrichedPrompt = buildEnrichedPrompt modCtx mCtx
+            case mEnrichedPrompt of
+              -- GHC warnings available: use enriched prompt path.
+              Just enrichedPrompt -> do
+                eOrMut <- withOracle env $ \h ->
+                  proposeMutationEnrichedH h fp src enrichedPrompt
+                case eOrMut of
+                  Left err -> do
+                    unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                      hPutStrLn stderr ("DGM.SelfMod: oracle-enriched error for " ++ fp ++ ": " ++ T.unpack err)
+                    return []
+                  Right om ->
+                    return (filter notBlacklisted [(fp, om, m)])
+              -- No warnings for this file: fall back to standard prompt.
+              Nothing -> do
+                let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
+                eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
+                case eOrMut of
+                  Left err -> do
+                    unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                      hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                    return []
+                  Right om ->
+                    return (filter notBlacklisted [(fp, om, m)])
+        return (oracleMuts ++ heuristicMuts)) fps
   return (concat perFile)
 
 -- | Sort mutation candidates for selection.
