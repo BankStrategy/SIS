@@ -50,15 +50,6 @@ import Data.Maybe (mapMaybe)
 
 import DGM.HsAST (HsMutation(..))
 
--- | Context from the archive to guide the oracle toward high-value mutations.
-data MutationContext = MutationContext
-  { mcBestScore       :: Double     -- ^ Best score achieved so far.
-  , mcTotalEntries    :: Int        -- ^ Total archive entries.
-  , mcPassRate        :: Double     -- ^ Fraction of mutations that passed tests.
-  , mcRecentSuccesses :: [Text]     -- ^ Last 3 successful mutation descriptions.
-  , mcEvolutionGoal   :: Maybe Text -- ^ Natural-language goal if set.
-  } deriving (Show, Eq)
-
 #ifdef WITH_ORACLE
 import Control.Monad (foldM)
 import Data.Aeson ((.:), (.=), object, encode, withObject)
@@ -67,6 +58,15 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Network.HTTP.Simple as HTTP
 #endif
+
+-- | Context from the archive to guide the oracle toward high-value mutations.
+data MutationContext = MutationContext
+  { mcBestScore       :: Double     -- ^ Best score achieved so far.
+  , mcTotalEntries    :: Int        -- ^ Total archive entries.
+  , mcPassRate        :: Double     -- ^ Fraction of mutations that passed tests.
+  , mcRecentSuccesses :: [Text]     -- ^ Last 3 successful mutation descriptions.
+  , mcEvolutionGoal   :: Maybe Text -- ^ Natural-language goal if set.
+  } deriving (Show, Eq)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Environment
