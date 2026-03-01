@@ -104,7 +104,7 @@ newOracleEnv = do
   where
     mkEnv k = OracleEnv
       { oeApiKey  = k
-      , oeModel   = "google/gemini-2.5-flash-lite"
+      , oeModel   = "google/gemini-3-flash-preview"
       , oeBaseUrl = "https://openrouter.ai/api/v1"
       }
 
@@ -234,6 +234,8 @@ proposeMutation env fp src tests mCtx = do
   let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
       bodyLBS = encode $ object
                   [ "model"    .= oeModel env
+                  , "temperature" .= (0.3 :: Double)
+                  , "max_tokens"  .= (4096 :: Int)
                   , "messages" .= Aeson.toJSON
                       [ object [ "role"    .= ("system" :: Text)
                                , "content" .= oracleSystemPrompt ]
