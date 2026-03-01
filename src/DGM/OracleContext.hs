@@ -266,7 +266,7 @@ cabalBin :: FilePath
 cabalBin = "/Users/raz/.ghcup/bin/cabal"
 
 ghcBin :: FilePath
-ghcBin = "/Users/raz/.ghcup/bin/ghc-9.6"
+ghcBin = "/Users/raz/.ghcup/bin/ghc-9.6.7"
 
 -- | Wait for @ph@ to exit, returning 'Nothing' if it exceeds @secs@ seconds.
 withTimeout :: Int -> ProcessHandle -> IO (Maybe ExitCode)

@@ -172,8 +172,9 @@ withSelfModTxn txn action = do
 runCabal :: [String] -> IO CompileResult
 runCabal args = do
   t0 <- nowMs
+  let fullArgs = args ++ ["--with-compiler=" ++ ghcBin]
   (_, Just hOut, Just hErr, ph) <-
-    createProcess (proc cabalBin args)
+    createProcess (proc cabalBin fullArgs)
       { std_out = CreatePipe
       , std_err = CreatePipe
       }
@@ -296,6 +297,11 @@ nowMs = do
 -- remains portable across machines that have ghcup installed.
 cabalBin :: FilePath
 cabalBin = "/Users/raz/.ghcup/bin/cabal"
+
+-- | Path to the GHC compiler.
+--
+-- Must be an actual executable (not a shell wrapper) for @--with-compiler@.
+ghcBin :: FilePath
+ghcBin = "/Users/raz/.ghcup/bin/ghc-9.6.7"
 -- NOTE: On machines without ghcup at this path, override by setting
--- the CABAL_BIN environment variable or ensure 'cabal' is on PATH and
--- replace the above literal with "cabal".
+-- the CABAL_BIN / GHC_BIN environment variables or ensure they are on PATH.
