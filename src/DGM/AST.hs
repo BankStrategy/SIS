@@ -113,7 +113,7 @@ data ExprF a
   | LetF  Text a a         -- ^ Let binding  @let x = val in body@
   | IfF   a a a            -- ^ Conditional  @if p then t else f@
   | BinOpF Text a a        -- ^ Binary operator (add, mul, eq, …)
-  | UnitF                  -- ^ Unit literal @()@
+  | UnitF                  -- ^ Unit literal @()@ (SPEC.md §4.3)
   deriving (Functor, Foldable, Traversable, Show, Eq)
 
 -- | @Expr@ is the recursive fixed-point of @ExprF@.
@@ -152,6 +152,8 @@ unit = Fix UnitF
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- | Convert an @Expr@ to a human-readable Haskell-like string.
+-- | Smart constructor for the unit literal.
+
 --
 -- This is a simple catamorphism: the algebra maps each @ExprF Text@ to the
 -- pretty-printed @Text@ by assembling child strings.
