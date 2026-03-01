@@ -28,7 +28,7 @@ import Control.Monad (forever)
 import Language.Haskell.Interpreter
   ( runInterpreter, setImports, interpret, typeOf, as
   , reset, set, OptionVal((:=)), languageExtensions
-  , Extension(Safe) )
+  , Extension(Safe, OverloadedStrings) )
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Internal request type
@@ -120,7 +120,9 @@ evalRuleCandidate HintEnv{..} code = do
     (runInterpreter $ do
        reset
        setImports ruleImports
-       -- No Safe extension: import-list restriction is our safety mechanism.
+       -- Enable OverloadedStrings so snippet string literals are inferred as
+       -- Text, matching the ExprF constructor fields (VarF Text, BinOpF Text ..).
+       set [languageExtensions := [OverloadedStrings]]
        interpret (T.unpack code) (as :: ExprF Int -> ExprF Int))
   pure $ case outcome of
     Left  ()          -> Left "Timeout evaluating rule candidate"

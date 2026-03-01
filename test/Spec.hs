@@ -774,33 +774,35 @@ hsASTTests = testGroup "DGM.HsAST"
         Left err -> assertFailure ("parseHsText failed: " <> T.unpack err)
         Right m  -> length (hsNodes m) >= 1 @?= True
 
-  -- ── addHaddockRule ─────────────────────────────────────────────────────────
+  -- ── addHaddockRule (inline-single-use-let) ──────────────────────────────────
 
-  , testCase "addHaddockTransform inserts stub before undocumented binding" $ do
-      let src = "module Foo where\n\nfoo x = x + 1\n"
+  , testCase "addHaddockTransform inlines single-use let binding" $ do
+      let src = "module Foo where\n\nfoo xs ys = let n = length xs in take n ys\n"
       case addHaddockTransform src of
-        Left err  -> assertFailure ("should have found undocumented binding: " <> T.unpack err)
-        Right out -> T.isInfixOf "-- | TODO" out @?= True
+        Left err  -> assertFailure ("should have found single-use let: " <> T.unpack err)
+        Right out -> T.isInfixOf "take (length xs) ys" out @?= True
 
-  , testCase "addHaddockTransform skips already-documented bindings" $ do
-      let src = "module Foo where\n\n-- | Documented\nfoo x = x\n"
+  , testCase "addHaddockTransform skips multi-use let binding" $ do
+      let src = "module Foo where\n\nfoo xs = let n = length xs in n + n\n"
       case addHaddockTransform src of
-        Left _  -> pure ()  -- expected: no undocumented bindings
-        Right _ -> assertFailure "should not fire when all bindings are documented"
+        Left _  -> pure ()  -- expected: n used twice
+        Right _ -> assertFailure "should not inline when var is used more than once"
 
-  -- ── addTypeAnnotationRule ──────────────────────────────────────────────────
+  -- ── addTypeAnnotationRule (remove-dead-let) ────────────────────────────────
 
-  , testCase "addTypeAnnotationTransform inserts stub for unannotated binding" $ do
-      let src = "module Foo where\n\nfoo x = x + 1\n"
+  , testCase "addTypeAnnotationTransform removes dead let binding" $ do
+      let src = "module Foo where\n\nfoo = let unused = expensive in result\n"
       case addTypeAnnotationTransform src of
-        Left err  -> assertFailure ("should have found unannotated binding: " <> T.unpack err)
-        Right out -> T.isInfixOf "_TODO_" out @?= True
+        Left err  -> assertFailure ("should have found dead let: " <> T.unpack err)
+        Right out -> do
+          T.isInfixOf "result" out @?= True
+          T.isInfixOf "unused" out @?= False
 
-  , testCase "addTypeAnnotationTransform skips annotated bindings" $ do
-      let src = "module Foo where\n\nfoo :: Int -> Int\nfoo x = x + 1\n"
+  , testCase "addTypeAnnotationTransform skips used let binding" $ do
+      let src = "module Foo where\n\nfoo = let x = 1 in x + 2\n"
       case addTypeAnnotationTransform src of
-        Left _  -> pure ()  -- expected: all bindings have signatures
-        Right _ -> assertFailure "should not fire when all bindings have type signatures"
+        Left _  -> pure ()  -- expected: x is used
+        Right _ -> assertFailure "should not remove when var is used in body"
 
   -- ── limitedEtaReduceRule ───────────────────────────────────────────────────
 
@@ -815,6 +817,30 @@ hsASTTests = testGroup "DGM.HsAST"
       case limitedEtaReduceTransform src of
         Left _  -> pure ()  -- expected: multi-arg not handled
         Right _ -> assertFailure "should not fire on multi-argument bindings"
+
+  -- ── simplifyIfRule ────────────────────────────────────────────────────────
+
+  , testCase "simplifyIfTransform reduces if True" $ do
+      let src = "module Foo where\n\nfoo = if True then bar else baz\n"
+      case simplifyIfTransform src of
+        Left err  -> assertFailure ("should have found if True: " <> T.unpack err)
+        Right out -> do
+          T.isInfixOf "bar" out @?= True
+          T.isInfixOf "if True" out @?= False
+
+  , testCase "simplifyIfTransform reduces if False" $ do
+      let src = "module Foo where\n\nfoo = if False then bar else baz\n"
+      case simplifyIfTransform src of
+        Left err  -> assertFailure ("should have found if False: " <> T.unpack err)
+        Right out -> do
+          T.isInfixOf "baz" out @?= True
+          T.isInfixOf "if False" out @?= False
+
+  , testCase "simplifyIfTransform does not fire on non-constant condition" $ do
+      let src = "module Foo where\n\nfoo x = if x then bar else baz\n"
+      case simplifyIfTransform src of
+        Left _  -> pure ()  -- expected: condition is not constant
+        Right _ -> assertFailure "should not fire on non-constant condition"
   ]
 
 -- | Drop trailing newline characters for lenient round-trip comparison.

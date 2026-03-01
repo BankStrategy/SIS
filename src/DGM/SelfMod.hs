@@ -35,7 +35,6 @@ module DGM.SelfMod
 
 import Control.Concurrent.STM (atomically, readTVar)
 import Control.Exception (catch, IOException)
-import Control.Concurrent.Async (mapConcurrently)
 import Control.Monad (unless)
 import Data.List (sortBy)
 import Data.Ord (comparing)
@@ -115,7 +114,7 @@ proposeSelfMutations
 proposeSelfMutations st fps mCtx = do
   blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
-  perFile    <- mapConcurrently (\fp -> do
+  perFile    <- mapM (\fp -> do
     result <- readOwnSource fp
     case result of
       Left _  -> return []
@@ -127,8 +126,8 @@ proposeSelfMutations st fps mCtx = do
         oracleMuts <- case mOracleEnv of
           Nothing  -> return []
           Just env -> do
-            let src   = printHsModule m
-                tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
+            src <- TIO.readFile fp
+            let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
             eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
             case eOrMut of
               Left err -> do

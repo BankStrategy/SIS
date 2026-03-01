@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -35,6 +36,8 @@ module DGM.HsAST
   , addTypeAnnotationTransform
   , limitedEtaReduceRule
   , limitedEtaReduceTransform
+  , simplifyIfRule
+  , simplifyIfTransform
   ) where
 
 import Data.Text (Text)
@@ -215,6 +218,7 @@ defaultHsRules =
   , addHaddockRule
   , addTypeAnnotationRule
   , limitedEtaReduceRule
+  , simplifyIfRule
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -369,87 +373,142 @@ isSimpleVar t
   | otherwise = isLower (T.head t)
                 && T.all (\c -> isAlphaNum c || c == '_' || c == '\'') t
 
+-- | True if 'c' is a Haskell identifier character.
+isIdentChar :: Char -> Bool
+isIdentChar c = isAlphaNum c || c == '_' || c == '\''
+
+-- | Count whole-word occurrences of @needle@ in @haystack@.
+countWholeWord :: Text -> Text -> Int
+countWholeWord needle haystack = go 0 haystack
+  where
+    nLen = T.length needle
+    go !n hay
+      | T.null hay = n
+      | otherwise  =
+          case T.breakOn needle hay of
+            (_, rest) | T.null rest -> n
+            (before, rest) ->
+              let charBefore = if T.null before then Nothing else Just (T.last before)
+                  afterNeedle = T.drop nLen rest
+                  charAfter  = if T.null afterNeedle then Nothing else Just (T.head afterNeedle)
+                  bounded    = not (maybe False isIdentChar charBefore)
+                            && not (maybe False isIdentChar charAfter)
+              in  go (if bounded then n + 1 else n) (T.drop 1 rest)
+
+-- | Replace the first whole-word occurrence of @needle@ with @replacement@.
+replaceWholeWord :: Text -> Text -> Text -> Text
+replaceWholeWord needle replacement haystack = go haystack
+  where
+    nLen = T.length needle
+    go hay
+      | T.null hay = hay
+      | otherwise  =
+          case T.breakOn needle hay of
+            (_, rest) | T.null rest -> hay
+            (before, rest) ->
+              let charBefore = if T.null before then Nothing else Just (T.last before)
+                  afterNeedle = T.drop nLen rest
+                  charAfter  = if T.null afterNeedle then Nothing else Just (T.head afterNeedle)
+                  bounded    = not (maybe False isIdentChar charBefore)
+                            && not (maybe False isIdentChar charAfter)
+              in  if bounded
+                  then before <> replacement <> afterNeedle
+                  else before <> T.take 1 rest <> go (T.drop 1 rest)
+
 -- ─────────────────────────────────────────────────────────────────────────────
--- Rule: add Haddock stub
+-- Rule: inline single-use let
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- | Rule: insert a @-- | TODO@ Haddock comment above the first undocumented
--- top-level binding.
+-- | Rule: inline a single-use @let x = expr in body@ on a single line.
+--
+-- Finds the first occurrence of @let x = expr in body@ where @x@ appears
+-- exactly once in @body@ (as a whole word), and substitutes @(expr)@ for @x@.
 addHaddockRule :: HsMutation
 addHaddockRule = HsMutation
-  { hmDescription = "add-haddock-stub"
+  { hmDescription = "inline-single-use-let"
   , hmTransform   = addHaddockTransform
   }
 
 addHaddockTransform :: Text -> Either Text Text
 addHaddockTransform src =
-  let ls = T.lines src
-      idx = findFirstUndocumented ls
-  in  case idx of
-        Nothing -> Left "no undocumented top-level bindings found"
-        Just i  ->
-          let before = take i ls
-              after  = drop i ls
-              stub   = "-- | TODO: document this function"
-          in  Right (T.unlines (before ++ [stub] ++ after))
+  let ls      = zip [0 :: Int ..] (T.lines src)
+      results = mapMaybe tryInlineLet ls
+  in  case results of
+        []             -> Left "no single-use let bindings found"
+        (i, newLine):_ ->
+          let original = T.lines src
+              patched  = take i original ++ [newLine] ++ drop (i + 1) original
+          in  Right (T.unlines patched)
   where
-    -- Find index of first line that looks like a top-level binding
-    -- and is NOT preceded by a "-- |" comment line.
-    findFirstUndocumented :: [Text] -> Maybe Int
-    findFirstUndocumented lns =
-      let indexed = zip [0..] lns
-          isBinding (_, l) =
-            let s = T.stripStart l
-            in  T.length s > 2
-             && not (T.null s)
-             && isLower (T.head s)
-             && (T.isInfixOf " = " s || T.isInfixOf " :: " s)
-          isHaddock l = "-- |" `T.isPrefixOf` T.stripStart l
-          prevLine i = if i == 0 then "" else lns !! (i - 1)
-      in  fmap fst $
-          listToMaybe $
-          filter (\(i, l) -> isBinding (i, l) && not (isHaddock (prevLine i))) indexed
+    tryInlineLet :: (Int, Text) -> Maybe (Int, Text)
+    tryInlineLet (idx, line) =
+      let stripped = T.strip line
+          indent   = T.takeWhile (== ' ') line
+      in  case T.breakOn "let " stripped of
+            (before, rest)
+              | T.null rest -> Nothing
+              | otherwise   ->
+                let afterLet = T.drop 4 rest  -- drop "let "
+                in  case T.breakOn " = " afterLet of
+                      (_, rhs) | T.null rhs -> Nothing
+                      (var, rhs') ->
+                        let varT     = T.strip var
+                            afterEq  = T.drop 3 rhs'  -- drop " = "
+                        in  case T.breakOn " in " afterEq of
+                              (_, bodyPart) | T.null bodyPart -> Nothing
+                              (expr, bodyPart') ->
+                                let bodyT = T.drop 4 bodyPart'  -- drop " in "
+                                in  if isSimpleVar varT
+                                       && countWholeWord varT bodyT == 1
+                                    then
+                                      let replaced = replaceWholeWord varT ("(" <> expr <> ")") bodyT
+                                      in  Just (idx, indent <> before <> replaced)
+                                    else Nothing
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Rule: add type annotation stub
+-- Rule: remove dead let
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- | Rule: insert a @{- name :: _TODO_ -}@ comment above the first top-level
--- binding that lacks a type signature on the preceding line.
+-- | Rule: remove a dead @let x = expr in body@ where @x@ is unused in @body@.
 addTypeAnnotationRule :: HsMutation
 addTypeAnnotationRule = HsMutation
-  { hmDescription = "add-type-annotation-stub"
+  { hmDescription = "remove-dead-let"
   , hmTransform   = addTypeAnnotationTransform
   }
 
 addTypeAnnotationTransform :: Text -> Either Text Text
 addTypeAnnotationTransform src =
-  let ls  = T.lines src
-      idx = findFirstUntyped ls
-  in  case idx of
-        Nothing -> Left "no unannotated top-level bindings found"
-        Just i  ->
-          let before = take i ls
-              after  = drop i ls
-              -- Extract the function name from the binding line
-              fname  = T.takeWhile (\c -> c /= ' ' && c /= '\t') (T.stripStart (ls !! i))
-              stub   = "{- " <> fname <> " :: _TODO_ -}"
-          in  Right (T.unlines (before ++ [stub] ++ after))
+  let ls      = zip [0 :: Int ..] (T.lines src)
+      results = mapMaybe tryDeadLet ls
+  in  case results of
+        []             -> Left "no dead let bindings found"
+        (i, newLine):_ ->
+          let original = T.lines src
+              patched  = take i original ++ [newLine] ++ drop (i + 1) original
+          in  Right (T.unlines patched)
   where
-    findFirstUntyped :: [Text] -> Maybe Int
-    findFirstUntyped lns =
-      let indexed = zip [0..] lns
-          isValueBinding (_, l) =
-            let s = T.stripStart l
-            in  not (T.null s)
-             && isLower (T.head s)
-             && " = " `T.isInfixOf` s
-             && not ("::" `T.isInfixOf` s)
-          prevLine i = if i == 0 then "" else lns !! (i - 1)
-          hasTypeSig i = "::" `T.isInfixOf` prevLine i
-      in  fmap fst $
-          listToMaybe $
-          filter (\(i, l) -> isValueBinding (i, l) && not (hasTypeSig i)) indexed
+    tryDeadLet :: (Int, Text) -> Maybe (Int, Text)
+    tryDeadLet (idx, line) =
+      let stripped = T.strip line
+          indent   = T.takeWhile (== ' ') line
+      in  case T.breakOn "let " stripped of
+            (before, rest)
+              | T.null rest -> Nothing
+              | otherwise   ->
+                let afterLet = T.drop 4 rest
+                in  case T.breakOn " = " afterLet of
+                      (_, rhs) | T.null rhs -> Nothing
+                      (var, rhs') ->
+                        let varT    = T.strip var
+                            afterEq = T.drop 3 rhs'
+                        in  case T.breakOn " in " afterEq of
+                              (_, bodyPart) | T.null bodyPart -> Nothing
+                              (_expr, bodyPart') ->
+                                let bodyT = T.drop 4 bodyPart'
+                                in  if isSimpleVar varT
+                                       && countWholeWord varT bodyT == 0
+                                    then Just (idx, indent <> before <> bodyT)
+                                    else Nothing
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule: limited eta-reduce (single-equation only)
@@ -504,6 +563,55 @@ limitedEtaReduceTransform src =
                        then Just (T.unwords (fname : init lhsArgs ++ ["="] ++ init rhs))
                        else Nothing
             _ -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rule: simplify constant if
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Simplify @if True then X else Y@ to @X@ and @if False then X else Y@ to @Y@.
+simplifyIfRule :: HsMutation
+simplifyIfRule = HsMutation
+  { hmDescription = "simplify-constant-if"
+  , hmTransform   = simplifyIfTransform
+  }
+
+simplifyIfTransform :: Text -> Either Text Text
+simplifyIfTransform src =
+  let ls      = zip [0 :: Int ..] (T.lines src)
+      results = mapMaybe trySimplifyIf ls
+  in  case results of
+        []             -> Left "no constant-condition if expressions found"
+        (i, newLine):_ ->
+          let original = T.lines src
+              patched  = take i original ++ [newLine] ++ drop (i + 1) original
+          in  Right (T.unlines patched)
+  where
+    trySimplifyIf :: (Int, Text) -> Maybe (Int, Text)
+    trySimplifyIf (idx, line) =
+      let indent = T.takeWhile (== ' ') line
+      in  case tryReplace "if True then " " else " line of
+            Just thenBranch -> Just (idx, indent <> T.strip thenBranch)
+            Nothing ->
+              case tryReplace "if False then " " else " line of
+                Just elseBranch -> Just (idx, indent <> T.strip elseBranch)
+                Nothing         -> Nothing
+
+    -- For "if True then X else Y", extract X.
+    -- For "if False then X else Y", extract Y.
+    tryReplace :: Text -> Text -> Text -> Maybe Text
+    tryReplace ifPat elsePat line =
+      let stripped = T.strip line
+      in  case T.breakOn ifPat stripped of
+            (_, rest) | T.null rest -> Nothing
+            (before, rest) ->
+              let afterIf = T.drop (T.length ifPat) rest
+              in  case T.breakOn elsePat afterIf of
+                    (_, elseRest) | T.null elseRest -> Nothing
+                    (thenBranch, elseRest) ->
+                      let elseBranch = T.drop (T.length elsePat) elseRest
+                      in  if ifPat == "if True then "
+                          then Just (before <> thenBranch)
+                          else Just (before <> elseBranch)
 
 #else
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -566,7 +674,7 @@ defaultHsRules = []
 
 -- | Stub — always Left.
 addHaddockRule :: HsMutation
-addHaddockRule = HsMutation "add-haddock-stub" addHaddockTransform
+addHaddockRule = HsMutation "inline-single-use-let" addHaddockTransform
 
 -- | Stub — always Left.
 addHaddockTransform :: Text -> Either Text Text
@@ -574,7 +682,7 @@ addHaddockTransform _ = Left stubMsg
 
 -- | Stub — always Left.
 addTypeAnnotationRule :: HsMutation
-addTypeAnnotationRule = HsMutation "add-type-annotation-stub" addTypeAnnotationTransform
+addTypeAnnotationRule = HsMutation "remove-dead-let" addTypeAnnotationTransform
 
 -- | Stub — always Left.
 addTypeAnnotationTransform :: Text -> Either Text Text
@@ -587,6 +695,14 @@ limitedEtaReduceRule = HsMutation "eta-reduce-single-eq" limitedEtaReduceTransfo
 -- | Stub — always Left.
 limitedEtaReduceTransform :: Text -> Either Text Text
 limitedEtaReduceTransform _ = Left stubMsg
+
+-- | Stub — always Left.
+simplifyIfRule :: HsMutation
+simplifyIfRule = HsMutation "simplify-constant-if" simplifyIfTransform
+
+-- | Stub — always Left.
+simplifyIfTransform :: Text -> Either Text Text
+simplifyIfTransform _ = Left stubMsg
 
 stubMsg :: Text
 stubMsg = "ghc-exactprint backend not enabled; build with -f+with-exactprint"

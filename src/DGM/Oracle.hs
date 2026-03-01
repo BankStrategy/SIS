@@ -163,10 +163,10 @@ buildMutationPrompt fp src tests mCtx =
   T.unlines $
     [ "Target file: " <> T.pack fp
     , ""
-    , "Module source:"
-    , "```haskell"
-    ] ++ T.lines src ++
-    [ "```"
+    , "Current source (line numbers for reference only, do not include in diff):"
+    , "---"
+    ] ++ zipWith (\i l -> T.pack (show i) <> " " <> l) [1::Int ..] (T.lines src) ++
+    [ "---"
     , ""
     ] ++
     ( if null tests then []
@@ -296,6 +296,7 @@ oracleHealthCheck env = do
 data DiffHunk = DiffHunk
   { hunkRemoves :: [Text]  -- ^ lines to remove (leading @-@ stripped)
   , hunkAdds    :: [Text]  -- ^ lines to add (leading @+@ stripped)
+  , hunkContext :: [Text]  -- ^ space-prefixed context lines (leading space stripped)
   } deriving (Show, Eq)
 
 -- | Split diff lines into hunks. Each hunk starts at a @\@\@ ... \@\@@ header line.
@@ -319,23 +320,34 @@ splitIntoHunks ls =
       , hunkAdds    = [ T.drop 1 l | l <- bodyLines
                                     , "+" `T.isPrefixOf` l
                                     , not ("+++" `T.isPrefixOf` l) ]
+      , hunkContext = [ T.drop 1 l | l <- bodyLines
+                                    , " " `T.isPrefixOf` l ]
       }
 
 -- | Apply a single hunk to source lines.
 -- For hunks with removes: find removes as contiguous block, replace with adds.
--- For insert-only hunks: append adds at end.
+-- For insert-only hunks with context: find context block, insert adds after it.
+-- For insert-only hunks without context: append adds at end.
 applyHunk :: DiffHunk -> [Text] -> Either Text [Text]
 applyHunk DiffHunk{..} srcLines
-  | null hunkRemoves =
-      -- Insert-only: append at end (conservative but safe)
+  | null hunkRemoves && null hunkContext =
+      -- Insert-only with no context: append at end
       Right (srcLines ++ hunkAdds)
+  | null hunkRemoves =
+      -- Insert-only with context: find context block, insert adds after it
+      case findSubseq hunkContext srcLines of
+        Nothing  -> Right (srcLines ++ hunkAdds)  -- fallback: append
+        Just idx ->
+          let before = take (idx + length hunkContext) srcLines
+              after  = drop (idx + length hunkContext) srcLines
+          in Right (before ++ hunkAdds ++ after)
   | otherwise =
       case findSubseq hunkRemoves srcLines of
-        Nothing  -> Left "oracle diff: hunk removes not found in source"
         Just idx ->
           let before = take idx srcLines
               after  = drop (idx + length hunkRemoves) srcLines
-          in  Right (before ++ hunkAdds ++ after)
+          in Right (before ++ hunkAdds ++ after)
+        Nothing  -> Left "oracle diff: hunk removes not found in source"
 
 -- | Parse a unified diff from an LLM text response into an 'HsMutation'.
 --
@@ -343,7 +355,8 @@ applyHunk DiffHunk{..} srcLines
 -- so multi-hunk diffs work correctly.
 parseDiffResponse :: Text -> Either Text HsMutation
 parseDiffResponse content =
-  let ls    = T.lines content
+  let stripped = stripMarkdownFences content
+      ls    = T.lines stripped
       hunks = splitIntoHunks ls
       nonEmpty = filter (\h -> not (null (hunkRemoves h)) || not (null (hunkAdds h))) hunks
   in  if null nonEmpty
@@ -363,18 +376,35 @@ parseDiffResponse content =
 -- Wraps the given removes\/adds as a single 'DiffHunk' and applies it.
 applyLineDiff :: [Text] -> [Text] -> Text -> Either Text Text
 applyLineDiff removes adds src =
-  let hunk = DiffHunk { hunkRemoves = removes, hunkAdds = adds }
+  let hunk = DiffHunk { hunkRemoves = removes, hunkAdds = adds, hunkContext = [] }
   in  fmap T.unlines $ applyHunk hunk (T.lines src)
 
 -- | Find the first index of @needle@ as a contiguous sublist of @haystack@.
-findSubseq :: Eq a => [a] -> [a] -> Maybe Int
+-- Normalizes trailing whitespace before comparing.
+findSubseq :: [Text] -> [Text] -> Maybe Int
 findSubseq needle haystack = go 0 haystack
   where
     n = length needle
+    norm = T.stripEnd
+    needleNorm = map norm needle
     go _ [] = Nothing
     go i xs
-      | take n xs == needle = Just i
-      | otherwise           = go (i + 1) (tail xs)
+      | map norm (take n xs) == needleNorm = Just i
+      | otherwise = go (i + 1) (tail xs)
+
+-- | Strip markdown fences (@```diff@, @```haskell@, @```@ etc.) from LLM output.
+stripMarkdownFences :: Text -> Text
+stripMarkdownFences t =
+  let ls = T.lines t
+      -- Drop leading fence line if present
+      ls1 = case ls of
+              (h:rest) | "```" `T.isPrefixOf` T.strip h -> rest
+              _ -> ls
+      -- Drop trailing fence line if present
+      ls2 = case reverse ls1 of
+              (h:rest) | "```" `T.isPrefixOf` T.strip h -> reverse rest
+              _ -> ls1
+  in T.unlines ls2
 
 #else
 
