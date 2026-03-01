@@ -45,6 +45,7 @@ import qualified Data.ByteString.Base16 as B16
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import System.FilePath (isAbsolute, normalise, splitPath)
 import System.IO (hPutStr, withFile, IOMode(..))
+import qualified Data.Text.IO as TIO
 import System.Directory (removeFile, renameFile)
 import System.IO.Error (isDoesNotExistError)
 import Control.Exception (catch, IOException)
@@ -342,13 +343,9 @@ atomicWriteFile path content = do
           pure (Left ("SystemWrite failed during rename: " <> T.pack (show ex)))
         Right () -> pure (Right ())
 
--- | Write @content@ to @path@ and verify the written file is non-empty.
+-- | Write @content@ to @path@ and verify the content is non-empty.
 writeAndVerify :: FilePath -> Text -> IO ()
 writeAndVerify path content = do
-  withFile path WriteMode $ \h ->
-    hPutStr h (T.unpack content)
-  -- Re-read to verify non-empty (basic sanity check; Phase B will add parse validation).
-  written <- readFile path
-  if null written
-    then ioError (userError ("SystemWrite: written file is empty: " <> path))
-    else pure ()
+  if T.null content
+    then ioError (userError ("SystemWrite: content is empty for: " <> path))
+    else TIO.writeFile path content

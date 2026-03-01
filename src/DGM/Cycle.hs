@@ -41,7 +41,6 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Exit (ExitCode)
-import System.FilePath ((</>))
 import System.IO (hFlush, stdout)
 import qualified System.IO
 import qualified System.Process
@@ -280,6 +279,9 @@ runSelfModCycle cfg = do
   let fps = case ccEvolutionGoal cfg of
                Nothing   -> fps0
                Just goal -> applyGoal goal fps0
+  -- Pre-read all source files before ghc-exactprint parsing to avoid file
+  -- locking: the GHC API holds handles that prevent subsequent TIO.readFile.
+  preReadSources <- mapM (\f -> do t <- TIO.readFile f; return (f, t)) fps
   modGraph   <- buildModuleGraph fps
   -- Read archive for oracle context and pattern mining.
   archiveEntries <- atomically (Archive.getAll (stateArchive st))
@@ -333,7 +335,7 @@ runSelfModCycle cfg = do
       emit cfg stepEnd
       pure [step1, step2, stepEnd]
 
-    _ -> tryCandidate cfg st step1 step2 oracleModel ranked 0
+    _ -> tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
 
 -- | Try up to 3 mutation candidates in sequence.  On apply failure, blacklist
 -- and advance to the next candidate.  On success, delegate to
@@ -344,18 +346,19 @@ tryCandidate
   -> StepResult        -- ^ step1 (propose)
   -> StepResult        -- ^ step2 (hypothesise)
   -> Maybe Text        -- ^ oracleModel tag
+  -> [(FilePath, Text)] -- ^ pre-read source contents
   -> [(FilePath, HsMutation, HsModule)]
   -> Int               -- ^ attempt counter (max 3)
   -> IO [StepResult]
-tryCandidate cfg _st step1 step2 _oracleModel [] _attempt = do
+tryCandidate cfg _st step1 step2 _oracleModel _srcs [] _attempt = do
   let stepEnd = StepResult StepPersist False "All candidates exhausted"
   emit cfg stepEnd
   pure [step1, step2, stepEnd]
-tryCandidate cfg st step1 step2 oracleModel _ attempt | attempt >= 3 = do
+tryCandidate cfg st step1 step2 oracleModel _srcs _ attempt | attempt >= 3 = do
   let stepEnd = StepResult StepPersist False "Max candidate attempts (3) reached"
   emit cfg stepEnd
   pure [step1, step2, stepEnd]
-tryCandidate cfg st step1 step2 oracleModel ((fp, mut, origModule) : rest) attempt =
+tryCandidate cfg st step1 step2 oracleModel srcs ((fp, mut, origModule) : rest) attempt =
   case applyHsMutation mut origModule of
     Left applyErr -> do
       let step3 = StepResult StepClassify False
@@ -368,10 +371,10 @@ tryCandidate cfg st step1 step2 oracleModel ((fp, mut, origModule) : rest) attem
         (Set.insert (fp, hmDescription mut))
       flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
       -- Try next candidate.
-      tryCandidate cfg st step1 step2 oracleModel rest (attempt + 1)
+      tryCandidate cfg st step1 step2 oracleModel srcs rest (attempt + 1)
 
     Right mutModule ->
-      runMutationPipeline cfg st step1 step2 oracleModel fp mut origModule mutModule
+      runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut origModule mutModule
 
 -- | Execute the write\/LH\/SBV\/test\/commit pipeline for a successfully applied
 -- mutation candidate.  Extracted from 'runSelfModCycle' to support
@@ -382,13 +385,17 @@ runMutationPipeline
   -> StepResult        -- ^ step1 (propose)
   -> StepResult        -- ^ step2 (hypothesise)
   -> Maybe Text        -- ^ oracleModel tag
+  -> [(FilePath, Text)] -- ^ pre-read source contents
   -> FilePath
   -> HsMutation
   -> HsModule          -- ^ original module
   -> HsModule          -- ^ mutated module
   -> IO [StepResult]
-runMutationPipeline cfg st step1 step2 oracleModel fp mut _origModule mutModule = do
-  origText <- TIO.readFile fp
+runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutModule = do
+  -- Use pre-read content to avoid file locking from ghc-exactprint.
+  let origText = case lookup fp srcs of
+                   Just t  -> t
+                   Nothing -> ""  -- shouldn't happen; fallback to empty
   let origLen = T.length origText
       mutLen  = T.length (printHsModule mutModule)
       txn = SelfModTxn
@@ -732,7 +739,7 @@ mkSelfModEntry gen desc fp score passed mLh mSbv mOracle = do
 -- * If @Types.hs@ is unreadable, the check is silently skipped.
 checkTypesHash :: AgentState -> IO ()
 checkTypesHash st = do
-  let typesPath = stateRepoRoot st </> "src" </> "DGM" </> "Types.hs"
+  let typesPath = stateRepoRoot st ++ "/src/DGM/Types.hs"
   msrc <- (Just <$> TIO.readFile typesPath)
             `catchExc` (\(_ :: SomeException) -> return Nothing)
   case msrc of

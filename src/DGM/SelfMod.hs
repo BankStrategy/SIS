@@ -115,9 +115,13 @@ proposeSelfMutations st fps mCtx = do
   blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
   perFile    <- mapM (\fp -> do
-    result <- readOwnSource fp
+    -- Read raw source first, then parse from text to avoid GHC API file locks.
+    src <- TIO.readFile fp
+    result <- parseHsText src
     case result of
-      Left _  -> return []
+      Left err -> do
+        hPutStrLn stderr ("DGM.SelfMod: parse error in " ++ fp ++ ": " ++ T.unpack err)
+        return []
       Right m -> do
         let notBlacklisted (f, mut, _) =
               (f, hmDescription mut) `Set.notMember` blacklist
@@ -126,7 +130,6 @@ proposeSelfMutations st fps mCtx = do
         oracleMuts <- case mOracleEnv of
           Nothing  -> return []
           Just env -> do
-            src <- TIO.readFile fp
             let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
             eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
             case eOrMut of
