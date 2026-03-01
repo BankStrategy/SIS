@@ -113,7 +113,7 @@ data ExprF a
   | LetF  Text a a         -- ^ Let binding  @let x = val in body@
   | IfF   a a a            -- ^ Conditional  @if p then t else f@
   | BinOpF Text a a        -- ^ Binary operator (add, mul, eq, …)
-  | UnitF                  -- ^ Unit value @()@
+  | UnitF                  -- ^ Unit literal @()@
   deriving (Functor, Foldable, Traversable, Show, Eq)
 
 -- | @Expr@ is the recursive fixed-point of @ExprF@.
@@ -146,6 +146,9 @@ binop op l r = Fix (BinOpF op l r)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Pretty-printer (catamorphism)
+
+unit :: Expr
+unit = Fix UnitF
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- | Convert an @Expr@ to a human-readable Haskell-like string.
