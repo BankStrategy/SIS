@@ -37,6 +37,7 @@ module DGM.Evolution
   ) where
 
 import Control.Concurrent.STM
+import Control.Monad (when)
 import Data.List (maximumBy, sortBy)
 import Data.Ord (comparing, Down(..))
 import qualified Data.Map.Strict as Map
@@ -180,14 +181,17 @@ data EvolutionConfig = EvolutionConfig
   , ecHypothesisDepth  :: Int
   , ecArchiveVar        :: TVar [ArchiveEntry]
   , ecStateVar          :: AgentState
+  , ecCurrentExpr       :: TVar Expr
+    -- ^ Live ExprF baseline — written back when a verified improvement is found.
   }
 
-defaultEvolutionConfig :: AgentState -> EvolutionConfig
-defaultEvolutionConfig st = EvolutionConfig
+defaultEvolutionConfig :: AgentState -> TVar Expr -> EvolutionConfig
+defaultEvolutionConfig st exprVar = EvolutionConfig
   { ecMaxGenerations  = 100
   , ecHypothesisDepth = 3
   , ecArchiveVar       = stateArchive st
   , ecStateVar         = st
+  , ecCurrentExpr      = exprVar
   }
 
 -- | Run the full DGM evolutionary loop for up to @ecMaxGenerations@ steps.
@@ -199,7 +203,7 @@ defaultEvolutionConfig st = EvolutionConfig
 --  4. Records the result (pass or fail) in the archive regardless.
 runEvolutionLoop :: EvolutionConfig -> IO ()
 runEvolutionLoop cfg = do
-  let st = ecStateVar cfg
+  let _st = ecStateVar cfg
   loop 0
   where
     loop gen
@@ -209,10 +213,7 @@ runEvolutionLoop cfg = do
           if not running
             then pure ()
             else do
-              currentAST <- atomically (readTVar (stateCurrentAST (ecStateVar cfg)))
-              -- Use bootstrap AST; a full system would parse astCode currentAST.
-              let baseline = bootstrapExpr
-              _ <- currentAST `seq` pure ()
+              baseline <- atomically (readTVar (ecCurrentExpr cfg))
 
               result <- evolveStep cfg baseline
 
@@ -233,6 +234,10 @@ runEvolutionLoop cfg = do
                         then failedMutations m + 1
                         else failedMutations m
                     }
+
+              -- Write back the winning expression when verified.
+              when (erVerified result) $
+                atomically $ writeTVar (ecCurrentExpr cfg) (erExpr result)
 
               loop (gen + 1)
 

@@ -60,7 +60,7 @@ import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flu
 import DGM.SafetyKernel
 import qualified DGM.Archive as Archive
 
-import DGM.HsAST (HsMutation(..), applyHsMutation, printHsModule)
+import DGM.HsAST (HsMutation(..), HsModule, applyHsMutation, printHsModule)
 import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation)
 import DGM.Liquid (verifyWithLiquid, LiquidResult(..))
 import DGM.SelfCompile
@@ -110,6 +110,10 @@ data CycleConfig = CycleConfig
     -- ^ Optional natural-language goal that filters candidate source files
     -- before mutation proposals (see 'DGM.NatLang').  'Nothing' means
     -- no filtering — all sources are considered.
+  , ccCurrentExpr      :: TVar Expr
+    -- ^ The live ExprF baseline for the ExprPhase feedback loop.
+    -- Winning expressions are written back here so the next cycle
+    -- starts from the improved AST rather than 'bootstrapExpr'.
   }
 
 defaultCycleConfig :: AgentState -> AuditLog -> ArchiveHandle -> IO CycleConfig
@@ -117,10 +121,11 @@ defaultCycleConfig st auditLog hdl = do
   propVar  <- newTVarIO defaultProposer
   dynRules <- newTVarIO []
   hintEnv  <- newHintEnv
+  exprVar  <- newTVarIO bootstrapExpr
   pure CycleConfig
     { ccAgentState       = st
     , ccSelfPlayCfg      = defaultSelfPlayConfig st
-    , ccEvolutionCfg     = defaultEvolutionConfig st
+    , ccEvolutionCfg     = defaultEvolutionConfig st exprVar
     , ccAuditLog         = auditLog
     , ccVerbose          = True
     , ccArchiveHandle    = hdl
@@ -129,6 +134,7 @@ defaultCycleConfig st auditLog hdl = do
     , ccDynamicRules     = dynRules
     , ccHintEnv          = hintEnv
     , ccEvolutionGoal    = Nothing
+    , ccCurrentExpr      = exprVar
     }
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +187,7 @@ runExprCycle cfg = do
   emit cfg step1
 
   -- ── Step 2: Hypothesis Generation (anamorphic unfold + dynamic rules) ───
-  baseline  <- pure bootstrapExpr
+  baseline  <- atomically (readTVar (ccCurrentExpr cfg))
   dynRules  <- atomically (readTVar (ccDynamicRules cfg))
   let depth = ecHypothesisDepth (ccEvolutionCfg cfg)
   let tree  = unfoldHypotheses depth baseline
@@ -241,6 +247,10 @@ runExprCycle cfg = do
               pure [step1, step2, step3, step4, step5, step6]
             Right ok -> do
               archiveSuccess cfg evalResult
+              -- Feed the winning expression back as the new baseline.
+              atomically $ do
+                writeTVar (ccCurrentExpr cfg) (erExpr evalResult)
+                writeTVar (stateCurrentAST st) (exprToASTNode "current" (erExpr evalResult))
               let step6 = StepResult StepPersist True ("Committed: " <> ok)
               emit cfg step6
               pure [step1, step2, step3, step4, step5, step6]
@@ -323,166 +333,198 @@ runSelfModCycle cfg = do
       emit cfg stepEnd
       pure [step1, step2, stepEnd]
 
-    ((fp, mut, origModule) : _) -> do
-      -- ── Step 3: Apply mutation, snapshot original for rollback ───────────
-      case applyHsMutation mut origModule of
-        Left applyErr -> do
-          let step3 = StepResult StepClassify False
-                        ("Mutation inapplicable: " <> applyErr)
-          emit cfg step3
-          archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
-          -- Blacklist inapplicable mutations too so they are not re-proposed.
-          atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
-            (Set.insert (fp, hmDescription mut))
-          flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
-          pure [step1, step2, step3]
+    _ -> tryCandidate cfg st step1 step2 oracleModel ranked 0
 
-        Right mutModule -> do
-          origText <- TIO.readFile fp
-          let origLen = T.length origText
-              mutLen  = T.length (printHsModule mutModule)
-              txn = SelfModTxn
-                      { smtFile         = fp
-                      , smtOriginalText = origText
-                      , smtMutation     = mut
-                      }
-              step3 = StepResult StepClassify True
-                        (  "Snapshot + mutation: " <> hmDescription mut
-                        <> " | file: " <> T.pack fp )
-          emit cfg step3
+-- | Try up to 3 mutation candidates in sequence.  On apply failure, blacklist
+-- and advance to the next candidate.  On success, delegate to
+-- 'runMutationPipeline' for the write\/test\/commit flow.
+tryCandidate
+  :: CycleConfig
+  -> AgentState
+  -> StepResult        -- ^ step1 (propose)
+  -> StepResult        -- ^ step2 (hypothesise)
+  -> Maybe Text        -- ^ oracleModel tag
+  -> [(FilePath, HsMutation, HsModule)]
+  -> Int               -- ^ attempt counter (max 3)
+  -> IO [StepResult]
+tryCandidate cfg _st step1 step2 _oracleModel [] _attempt = do
+  let stepEnd = StepResult StepPersist False "All candidates exhausted"
+  emit cfg stepEnd
+  pure [step1, step2, stepEnd]
+tryCandidate cfg st step1 step2 oracleModel _ attempt | attempt >= 3 = do
+  let stepEnd = StepResult StepPersist False "Max candidate attempts (3) reached"
+  emit cfg stepEnd
+  pure [step1, step2, stepEnd]
+tryCandidate cfg st step1 step2 oracleModel ((fp, mut, origModule) : rest) attempt =
+  case applyHsMutation mut origModule of
+    Left applyErr -> do
+      let step3 = StepResult StepClassify False
+                    ("Mutation inapplicable (attempt " <> T.pack (show (attempt + 1))
+                    <> "): " <> applyErr)
+      emit cfg step3
+      archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+      -- Blacklist inapplicable mutation so it is not re-proposed.
+      atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+        (Set.insert (fp, hmDescription mut))
+      flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
+      -- Try next candidate.
+      tryCandidate cfg st step1 step2 oracleModel rest (attempt + 1)
 
-          -- ── Steps 4-5: Write + LH + SBV + cabal test (transactional) ─────
-          nowPosix <- getPOSIXTime
-          let now    = floor nowPosix :: Int64
-              opName = "write:" <> T.pack fp
-              proof  = mockQuorumProof opName now
+    Right mutModule ->
+      runMutationPipeline cfg st step1 step2 oracleModel fp mut origModule mutModule
 
-          -- IORefs capture intermediate results for step messages + archive.
-          scoreRef <- newIORef (0.0 :: Double)
-          lhRef    <- newIORef (Nothing :: Maybe Text)
-          sbvRef   <- newIORef (Nothing :: Maybe Text)
+-- | Execute the write\/LH\/SBV\/test\/commit pipeline for a successfully applied
+-- mutation candidate.  Extracted from 'runSelfModCycle' to support
+-- 'tryCandidate' without duplicating the pipeline logic.
+runMutationPipeline
+  :: CycleConfig
+  -> AgentState
+  -> StepResult        -- ^ step1 (propose)
+  -> StepResult        -- ^ step2 (hypothesise)
+  -> Maybe Text        -- ^ oracleModel tag
+  -> FilePath
+  -> HsMutation
+  -> HsModule          -- ^ original module
+  -> HsModule          -- ^ mutated module
+  -> IO [StepResult]
+runMutationPipeline cfg st step1 step2 oracleModel fp mut _origModule mutModule = do
+  origText <- TIO.readFile fp
+  let origLen = T.length origText
+      mutLen  = T.length (printHsModule mutModule)
+      txn = SelfModTxn
+              { smtFile         = fp
+              , smtOriginalText = origText
+              , smtMutation     = mut
+              }
+      step3 = StepResult StepClassify True
+                (  "Snapshot + mutation: " <> hmDescription mut
+                <> " | file: " <> T.pack fp )
+  emit cfg step3
 
-          txnResult <- withSelfModTxn txn $ do
-            wr <- writeMutation st (ccAuditLog cfg) proof fp mutModule
-            case wr of
-              Left writeErr -> return (Left ("Write failed: " <> writeErr))
-              Right () -> do
-                -- ── LiquidHaskell pre-flight (pillar II formal verification) ─
-                -- If WITH_LIQUID is enabled this runs LH on the mutated file.
-                -- LiquidUnsafe/Error triggers immediate rollback before cabal
-                -- test, giving faster rejection for refinement violations.
-                -- Without WITH_LIQUID, verifyWithLiquid is a pass-through stub.
-                lhResult <- verifyWithLiquid (stateRepoRoot st) fp
-                let lhText = case lhResult of
-                      LiquidSafe       -> "SAFE"
-                      LiquidUnsafe det -> "UNSAFE: " <> det
-                      LiquidError  msg -> "ERROR: "  <> msg
-                writeIORef lhRef (Just lhText)
-                case lhResult of
-                  LiquidUnsafe details ->
-                    return (Left ("LiquidHaskell UNSAFE: " <> details))
-                  LiquidError msg ->
-                    return (Left ("LiquidHaskell error: " <> msg))
-                  LiquidSafe -> do
-                    -- ── SBV equivalence check (pillar II formal verification) ─
-                    -- SelfModPhase uses bootstrapExpr as a structural placeholder;
-                    -- genuine SBV semantics apply to ExprPhase mutations.
-                    -- Counter-examples from Falsifiable are enqueued into
-                    -- stateSbvQueue for future ExprPhase endogenous tasks.
-                    let spec = EquivSpec
-                                 { esName          = "selfmod-equiv"
-                                 , esOriginal      = bootstrapExpr
-                                 , esMutated       = bootstrapExpr
-                                 , esInputDomain   = []
-                                 , esSymbolicBound = 0
-                                 }
-                    sbvResult <- verifyEquivalence spec
-                    let sbvText = case sbvResult of
-                          Verified _    -> "QED"
-                          Falsifiable _ -> "Falsifiable"
-                          VTimeout    _ -> "Timeout"
-                    writeIORef sbvRef (Just sbvText)
-                    case sbvResult of
-                      Falsifiable ce -> do
-                        atomically (modifyTVar' (stateSbvQueue st) (ce:))
-                        return (Left "SBV Falsifiable: counter-example enqueued")
-                      VTimeout msg ->
-                        return (Left ("SBV timeout: " <> msg))
-                      Verified _ -> do
-                        cr <- testSelf
-                        let base = scoreCompileResult cr
-                            sc   = enrichScore base origLen mutLen (Just lhText)
-                        writeIORef scoreRef sc
-                        if sc >= 1.0
-                          then return (Right ())
-                          else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
+  -- ── Steps 4-5: Write + LH + SBV + cabal test (transactional) ─────────
+  nowPosix <- getPOSIXTime
+  let now    = floor nowPosix :: Int64
+      opName = "write:" <> T.pack fp
+      proof  = mockQuorumProof opName now
 
-          score   <- readIORef scoreRef
-          mLhText <- readIORef lhRef
-          mSbvText <- readIORef sbvRef
-          let lhDisplay  = fromMaybe "n/a" mLhText
-              sbvDisplay = fromMaybe "n/a" mSbvText
+  -- IORefs capture intermediate results for step messages + archive.
+  scoreRef <- newIORef (0.0 :: Double)
+  lhRef    <- newIORef (Nothing :: Maybe Text)
+  sbvRef   <- newIORef (Nothing :: Maybe Text)
 
-          let step4Desc  ok msg = StepResult StepVerify       ok msg
-              step4bDesc ok msg = StepResult StepFormalVerify ok msg
-              step5Desc  ok msg = StepResult StepTest         ok msg
-              step6Desc  ok msg = StepResult StepPersist      ok msg
+  txnResult <- withSelfModTxn txn $ do
+    wr <- writeMutation st (ccAuditLog cfg) proof fp mutModule
+    case wr of
+      Left writeErr -> return (Left ("Write failed: " <> writeErr))
+      Right () -> do
+        -- ── LiquidHaskell pre-flight (pillar II formal verification) ─────
+        lhResult <- verifyWithLiquid (stateRepoRoot st) fp
+        let lhText = case lhResult of
+              LiquidSafe       -> "SAFE"
+              LiquidUnsafe det -> "UNSAFE: " <> det
+              LiquidError  msg -> "ERROR: "  <> msg
+        writeIORef lhRef (Just lhText)
+        case lhResult of
+          LiquidUnsafe details ->
+            return (Left ("LiquidHaskell UNSAFE: " <> details))
+          LiquidError msg ->
+            return (Left ("LiquidHaskell error: " <> msg))
+          LiquidSafe -> do
+            -- ── SBV equivalence check (pillar II formal verification) ────
+            let spec = EquivSpec
+                         { esName          = "selfmod-equiv"
+                         , esOriginal      = bootstrapExpr
+                         , esMutated       = bootstrapExpr
+                         , esInputDomain   = []
+                         , esSymbolicBound = 0
+                         }
+            sbvResult <- verifyEquivalence spec
+            let sbvText = case sbvResult of
+                  Verified _    -> "QED"
+                  Falsifiable _ -> "Falsifiable"
+                  VTimeout    _ -> "Timeout"
+            writeIORef sbvRef (Just sbvText)
+            case sbvResult of
+              Falsifiable ce -> do
+                atomically (modifyTVar' (stateSbvQueue st) (ce:))
+                return (Left "SBV Falsifiable: counter-example enqueued")
+              VTimeout msg ->
+                return (Left ("SBV timeout: " <> msg))
+              Verified _ -> do
+                cr <- testSelf
+                let base = scoreCompileResult cr
+                    sc   = enrichScore base origLen mutLen (Just lhText)
+                writeIORef scoreRef sc
+                if sc >= 1.0
+                  then return (Right ())
+                  else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
 
-          case txnResult of
-            Left err -> do
-              let step4 = step4Desc False
-                            ("LH: " <> lhDisplay <> " | " <> err)
-              emit cfg step4
-              -- Emit StepFormalVerify only if SBV actually ran.
-              sbvSteps <- case mSbvText of
-                Nothing -> pure []
-                Just _  -> do
-                  let step4b = step4bDesc False ("SBV: " <> sbvDisplay)
-                  emit cfg step4b
-                  pure [step4b]
-              let step5 = step5Desc False ("Score: " <> T.pack (show score))
-              emit cfg step5
-              archiveSelfModFailed cfg (hmDescription mut) fp score mLhText mSbvText oracleModel
-              -- Blacklist this (file, mutation) pair so it is not re-proposed.
-              atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
-                (Set.insert (fp, hmDescription mut))
-              flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
-              let step6 = step6Desc False
-                            ("Rollback complete | score=" <> T.pack (show score))
-              emit cfg step6
-              pure ([step1, step2, step3, step4] ++ sbvSteps ++ [step5, step6])
+  score   <- readIORef scoreRef
+  mLhText <- readIORef lhRef
+  mSbvText <- readIORef sbvRef
+  let lhDisplay  = fromMaybe "n/a" mLhText
+      sbvDisplay = fromMaybe "n/a" mSbvText
 
-            Right () -> do
-              let step4 = step4Desc True
-                            ("LH: " <> lhDisplay <> " | mutation written: " <> T.pack fp)
-              emit cfg step4
-              let step4b = step4bDesc True ("SBV: " <> sbvDisplay)
-              emit cfg step4b
-              let step5 = step5Desc True
-                            ("Score: " <> T.pack (show score) <> " (all tests pass)")
-              emit cfg step5
-              -- Create archive entry with full provenance.
-              gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
-              entry <- mkSelfModEntry gen (hmDescription mut) fp score True mLhText mSbvText oracleModel
-              -- Commit the mutation to git.
-              commitResult <- commitMutation fp mut entry
-              let step6 = case commitResult of
-                    Right gitHash ->
-                      step6Desc True
-                        (  "Committed " <> T.take 8 gitHash
-                        <> " | score=" <> T.pack (show score) )
-                    Left commitErr ->
-                      step6Desc False
-                        (  "Commit failed: " <> commitErr
-                        <> " | score=" <> T.pack (show score) )
-              emit cfg step6
-              -- Archive the entry regardless of commit outcome — tests passed.
-              atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
-              flushArchive (ccArchiveHandle cfg) [entry]
-              atomically $ modifyTVar' (stateGeneration (ccAgentState cfg)) (+1)
-              -- ── Hint sub-step: propose + evaluate dynamic rule ─────────────
-              hintSteps <- runHintSubStep cfg
-              pure ([step1, step2, step3, step4, step4b, step5, step6] ++ hintSteps)
+  let step4Desc  ok msg = StepResult StepVerify       ok msg
+      step4bDesc ok msg = StepResult StepFormalVerify ok msg
+      step5Desc  ok msg = StepResult StepTest         ok msg
+      step6Desc  ok msg = StepResult StepPersist      ok msg
+
+  case txnResult of
+    Left err -> do
+      let step4 = step4Desc False
+                    ("LH: " <> lhDisplay <> " | " <> err)
+      emit cfg step4
+      -- Emit StepFormalVerify only if SBV actually ran.
+      sbvSteps <- case mSbvText of
+        Nothing -> pure []
+        Just _  -> do
+          let step4b = step4bDesc False ("SBV: " <> sbvDisplay)
+          emit cfg step4b
+          pure [step4b]
+      let step5 = step5Desc False ("Score: " <> T.pack (show score))
+      emit cfg step5
+      archiveSelfModFailed cfg (hmDescription mut) fp score mLhText mSbvText oracleModel
+      -- Blacklist this (file, mutation) pair so it is not re-proposed.
+      atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+        (Set.insert (fp, hmDescription mut))
+      flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
+      let step6 = step6Desc False
+                    ("Rollback complete | score=" <> T.pack (show score))
+      emit cfg step6
+      pure ([step1, step2, step3, step4] ++ sbvSteps ++ [step5, step6])
+
+    Right () -> do
+      let step4 = step4Desc True
+                    ("LH: " <> lhDisplay <> " | mutation written: " <> T.pack fp)
+      emit cfg step4
+      let step4b = step4bDesc True ("SBV: " <> sbvDisplay)
+      emit cfg step4b
+      let step5 = step5Desc True
+                    ("Score: " <> T.pack (show score) <> " (all tests pass)")
+      emit cfg step5
+      -- Create archive entry with full provenance.
+      gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
+      entry <- mkSelfModEntry gen (hmDescription mut) fp score True mLhText mSbvText oracleModel
+      -- Commit the mutation to git.
+      commitResult <- commitMutation fp mut entry
+      let step6 = case commitResult of
+            Right gitHash ->
+              step6Desc True
+                (  "Committed " <> T.take 8 gitHash
+                <> " | score=" <> T.pack (show score) )
+            Left commitErr ->
+              step6Desc False
+                (  "Commit failed: " <> commitErr
+                <> " | score=" <> T.pack (show score) )
+      emit cfg step6
+      -- Archive the entry regardless of commit outcome — tests passed.
+      atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
+      flushArchive (ccArchiveHandle cfg) [entry]
+      atomically $ modifyTVar' (stateGeneration (ccAgentState cfg)) (+1)
+      -- ── Hint sub-step: propose + evaluate dynamic rule ─────────────────
+      hintSteps <- runHintSubStep cfg
+      pure ([step1, step2, step3, step4, step4b, step5, step6] ++ hintSteps)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Hint sub-step: propose + evaluate + test + commit/reject dynamic rule
@@ -571,14 +613,25 @@ runHintSubStep cfg = do
 
 -- | Pool of heuristic rule candidates cycled through in offline / no-key environments.
 --
--- The first entry (@fmap id@) is the identity — it always fires but produces
--- no change, so it is rejected by the score test.  Later entries produce
--- structural changes and are committed when they fire.
+-- Each candidate is a Haskell expression of type @ExprF Int -> ExprF Int@
+-- evaluated by @evalRuleCandidate@ via the GHC hint interpreter.  The rule
+-- operates on a single functor layer whose children are 0-based integer labels;
+-- returning the same value means "no change" and the rule is skipped.
+--
+-- Rules are tried at every subterm position by @applyDynamicRules@.
 heuristicCandidates :: [Text]
 heuristicCandidates =
-  [ "\\x -> fmap id x"          -- identity (baseline; expected to be rejected)
-  , "\\x -> fmap (+1) x"        -- increment all leaf ints (structural change)
-  , "\\x -> fmap (\\n -> n * 2) x"  -- double all leaf ints
+  [ -- 1. Commute addition: (a + b) -> (b + a).  Fires on every BinOpF "+" node.
+    "\\x -> case x of { BinOpF \"+\" l r -> BinOpF \"+\" r l ; _ -> x }"
+  , -- 2. Commute multiplication: (a * b) -> (b * a).
+    "\\x -> case x of { BinOpF \"*\" l r -> BinOpF \"*\" r l ; _ -> x }"
+  , -- 3. Unit sink: replace UnitF with LitF 0 (useful as a seed value).
+    "\\x -> case x of { UnitF -> LitF 0 ; _ -> x }"
+  , -- 4. Equality to less-than: (a == b) -> (a < b).  Speculative mutation that
+    --    changes semantics; the sandbox test will reject if it breaks correctness.
+    "\\x -> case x of { BinOpF \"==\" l r -> BinOpF \"<\" l r ; _ -> x }"
+  , -- 5. Subtract to add: (a - b) -> (a + b).  Speculative; sandbox rejects if wrong.
+    "\\x -> case x of { BinOpF \"-\" l r -> BinOpF \"+\" l r ; _ -> x }"
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
