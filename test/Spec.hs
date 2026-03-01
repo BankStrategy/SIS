@@ -28,6 +28,7 @@ import Test.Tasty.QuickCheck
 
 import DGM
 import DGM.Liquid (LiquidResult(..), parseLiquidOutput, verifyWithLiquid)
+import DGM.OracleContext (GhcWarning(..), WarningKind(..), ModuleContext(..), parseGhcWarnings, buildModuleContext, buildEnrichedPrompt)
 
 main :: IO ()
 main = defaultMain tests
@@ -55,6 +56,7 @@ tests = testGroup "DGM"
   , dynamicRuleTests
   , pipelineTests
   , natLangTests
+  , oracleContextTests
 #ifdef WITH_SQLITE
   , sqliteArchiveTests
 #endif
@@ -1350,7 +1352,7 @@ modGraphTests = testGroup "DGM.ModGraph"
       fps  <- discoverSources
       mg   <- buildModuleGraph fps
       node <- newAgentState (ASTNode "n" ModuleNode [] Nothing)
-      candidates <- proposeSelfMutations node fps Nothing
+      candidates <- proposeSelfMutations node fps Nothing mg []
       let ranked = rankMutations mg candidates
       length ranked @?= length candidates
 
@@ -1788,7 +1790,8 @@ oracleTests = testGroup "DGM.Oracle"
       st  <- newAgentState node
       fps <- discoverSources
       -- If no oracle key is present, falls back gracefully to heuristics.
-      candidates <- proposeSelfMutations st fps Nothing
+      mg <- buildModuleGraph fps
+      candidates <- proposeSelfMutations st fps Nothing mg []
       -- Result is a list (possibly empty); no exception should be thrown.
       length candidates >= 0 @?= True
   ]
@@ -2119,4 +2122,126 @@ natLangTests = testGroup "DGM.NatLang"
       let mc = PreferModule "Archive"
           s  = show mc
       s @?= "PreferModule \"Archive\""
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- DGM.OracleContext tests
+-- ─────────────────────────────────────────────────────────────────────────────
+
+oracleContextTests :: TestTree
+oracleContextTests = testGroup "DGM.OracleContext"
+  [ -- ── parseGhcWarnings ─────────────────────────────────────────────────────
+    testCase "parseGhcWarnings: parses unused import warning" $ do
+      let input = T.unlines
+            [ "src/DGM/Foo.hs:5:1: warning: [-Wunused-imports]"
+            , "    The import of \8216Data.List (sort)\8217 is redundant"
+            ]
+          ws = parseGhcWarnings input
+      length ws @?= 1
+      gwFile (head ws) @?= "src/DGM/Foo.hs"
+      gwLine (head ws) @?= 5
+      case gwKind (head ws) of
+        UnusedImport name -> name @?= "Data.List (sort)"
+        other -> assertFailure ("Expected UnusedImport, got: " ++ show other)
+
+  , testCase "parseGhcWarnings: parses unused binding warning" $ do
+      let input = T.unlines
+            [ "src/DGM/Bar.hs:42:1: warning: [-Wunused-top-binds]"
+            , "    \8216helper\8217 is defined but not used"
+            ]
+          ws = parseGhcWarnings input
+      length ws @?= 1
+      case gwKind (head ws) of
+        UnusedBind name -> name @?= "helper"
+        other -> assertFailure ("Expected UnusedBind, got: " ++ show other)
+
+  , testCase "parseGhcWarnings: parses missing signature warning" $ do
+      let input = T.unlines
+            [ "src/DGM/Baz.hs:10:1: warning: [-Wmissing-signatures]"
+            , "    Top-level binding with no type signature: \8216myFunc\8217"
+            ]
+          ws = parseGhcWarnings input
+      length ws @?= 1
+      case gwKind (head ws) of
+        MissingSignature name -> name @?= "myFunc"
+        other -> assertFailure ("Expected MissingSignature, got: " ++ show other)
+
+  , testCase "parseGhcWarnings: handles multiple warnings" $ do
+      let input = T.unlines
+            [ "src/DGM/Foo.hs:5:1: warning: [-Wunused-imports]"
+            , "    The import of \8216Data.List\8217 is redundant"
+            , "src/DGM/Foo.hs:20:1: warning: [-Wunused-top-binds]"
+            , "    \8216unused\8217 is defined but not used"
+            ]
+          ws = parseGhcWarnings input
+      length ws @?= 2
+
+  , testCase "parseGhcWarnings: empty input returns []" $ do
+      let ws = parseGhcWarnings ""
+      ws @?= []
+
+  -- ── buildModuleContext ─────────────────────────────────────────────────────
+  , testCase "buildModuleContext: filters warnings to target file" $ do
+      let w1 = GhcWarning "src/DGM/Foo.hs" 5 (UnusedImport "Data.List") "unused"
+          w2 = GhcWarning "src/DGM/Bar.hs" 10 (UnusedBind "helper") "unused"
+          mg = emptyModuleGraph
+          src = "module Foo where\nfoo = 1\n"
+          ctx = buildModuleContext mg [w1, w2] "src/DGM/Foo.hs" src
+      length (mcWarnings ctx) @?= 1
+      gwFile (head (mcWarnings ctx)) @?= "src/DGM/Foo.hs"
+
+  , testCase "buildModuleContext: includes exports from source" $ do
+      let mg = emptyModuleGraph
+          src = T.unlines
+            [ "module DGM.Foo"
+            , "  ( fooFunc"
+            , "  , barFunc"
+            , "  ) where"
+            , ""
+            , "fooFunc = 1"
+            , "barFunc = 2"
+            ]
+          ctx = buildModuleContext mg [] "src/DGM/Foo.hs" src
+      "fooFunc" `elem` mcExports ctx @?= True
+      "barFunc" `elem` mcExports ctx @?= True
+
+  -- ── buildEnrichedPrompt ────────────────────────────────────────────────────
+  , testCase "buildEnrichedPrompt: includes VERIFIED SAFE REMOVALS section" $ do
+      let ctx = ModuleContext
+            { mcFilePath    = "src/DGM/Foo.hs"
+            , mcSource      = "module Foo where\nfoo = 1\n"
+            , mcWarnings    = [GhcWarning "src/DGM/Foo.hs" 5 (UnusedImport "Data.List") "unused"]
+            , mcExports     = ["foo"]
+            , mcReverseDeps = []
+            }
+      case buildEnrichedPrompt ctx Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt -> do
+          T.isInfixOf "VERIFIED SAFE REMOVALS" prompt @?= True
+          T.isInfixOf "unused import" prompt @?= True
+
+  , testCase "buildEnrichedPrompt: includes DO NOT TOUCH section" $ do
+      let ctx = ModuleContext
+            { mcFilePath    = "src/DGM/Foo.hs"
+            , mcSource      = "module Foo where\nfoo = 1\n"
+            , mcWarnings    = [GhcWarning "src/DGM/Foo.hs" 5 (UnusedImport "Data.List") "unused"]
+            , mcExports     = ["buildModuleGraph", "numDependents"]
+            , mcReverseDeps = ["DGM.Cycle"]
+            }
+      case buildEnrichedPrompt ctx Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt -> do
+          T.isInfixOf "DO NOT TOUCH" prompt @?= True
+          T.isInfixOf "buildModuleGraph" prompt @?= True
+          T.isInfixOf "DGM.Cycle" prompt @?= True
+
+  , testCase "buildEnrichedPrompt: returns Nothing when no warnings" $ do
+      let ctx = ModuleContext
+            { mcFilePath    = "src/DGM/Foo.hs"
+            , mcSource      = "module Foo where\nfoo = 1\n"
+            , mcWarnings    = []
+            , mcExports     = ["foo"]
+            , mcReverseDeps = []
+            }
+      buildEnrichedPrompt ctx Nothing @?= Nothing
   ]

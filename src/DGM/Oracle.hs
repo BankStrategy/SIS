@@ -31,6 +31,7 @@ module DGM.Oracle
   , newOracleEnv
     -- * Proposal
   , proposeMutation
+  , proposeMutationEnriched
   , MutationContext(..)
     -- * Scoring
   , scoreAndRankMutations
@@ -292,6 +293,53 @@ oracleHealthCheck env = do
           let sc = HTTP.getResponseStatusCode resp
           in  return (sc >= 200 && sc < 300)
 
+-- | System prompt for enriched (GHC-guided) mutation requests.
+oracleEnrichedSystemPrompt :: Text
+oracleEnrichedSystemPrompt =
+  "You are a precise Haskell refactoring tool. You receive a module with " <>
+  "GHC-verified safe removals. Pick exactly ONE removal from the VERIFIED " <>
+  "SAFE REMOVALS section and produce a minimal unified diff. Output ONLY " <>
+  "the diff. No explanation, no markdown fences, no line numbers."
+
+-- | Like 'proposeMutation' but takes a pre-built enriched prompt instead of
+-- building its own.  Used when GHC warnings provide verified safe operations.
+proposeMutationEnriched
+  :: OracleEnv
+  -> FilePath -> Text -> Text   -- ^ file path, source, enriched prompt
+  -> IO (Either Text HsMutation)
+proposeMutationEnriched env fp _src enrichedPrompt = do
+  let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
+      bodyLBS = encode $ object
+                  [ "model"    .= oeModel env
+                  , "temperature" .= (0.2 :: Double)
+                  , "max_tokens"  .= (4096 :: Int)
+                  , "messages" .= Aeson.toJSON
+                      [ object [ "role"    .= ("system" :: Text)
+                               , "content" .= oracleEnrichedSystemPrompt ]
+                      , object [ "role"    .= ("user" :: Text)
+                               , "content" .= enrichedPrompt ]
+                      ]
+                  ]
+  eReq <- try (HTTP.parseRequest url) :: IO (Either SomeException HTTP.Request)
+  case eReq of
+    Left err -> return (Left ("oracle-enriched: bad URL: " <> T.pack (show err)))
+    Right req0 -> do
+      let req = HTTP.setRequestMethod "POST"
+              $ HTTP.addRequestHeader "Content-Type"  "application/json"
+              $ HTTP.addRequestHeader "Authorization"
+                  ("Bearer " <> BS8.pack (T.unpack (oeApiKey env)))
+              $ HTTP.setRequestBodyLBS bodyLBS req0
+      eResp <- try (HTTP.httpLBS req)
+                 :: IO (Either SomeException (HTTP.Response LBS.ByteString))
+      case eResp of
+        Left err   -> return (Left ("oracle-enriched: HTTP error: " <> T.pack (show err)))
+        Right resp -> return $ case Aeson.decode (HTTP.getResponseBody resp) of
+          Nothing                   -> Left "oracle-enriched: JSON decode failed"
+          Just (OracleResponse txt) ->
+            case parseDiffResponse txt of
+              Right hm -> Right hm { hmDescription = "oracle-enriched: " <> hmDescription hm }
+              Left err -> Left err
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Diff parsing and application (WITH_ORACLE only)
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +492,16 @@ proposeMutation
   -> Maybe MutationContext -- ^ Optional archive feedback for guided mutation.
   -> IO (Either Text HsMutation)
 proposeMutation _env _fp _src _tests _mCtx =
+  return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
+
+-- | Like 'proposeMutation' but takes a pre-built enriched prompt.
+--
+-- __Stub behaviour__: always returns a @Left@ explanation.
+proposeMutationEnriched
+  :: OracleEnv
+  -> FilePath -> Text -> Text
+  -> IO (Either Text HsMutation)
+proposeMutationEnriched _env _fp _src _prompt =
   return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
 
 -- | Score and rank mutations.

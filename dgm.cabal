@@ -98,6 +98,7 @@ library
     , DGM.Liquid
     , DGM.Oracle
     , DGM.OracleHandle
+    , DGM.OracleContext
     , DGM.NatLang
     , DGM.RuleMiner
   hs-source-dirs:  src

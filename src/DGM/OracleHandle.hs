@@ -32,13 +32,14 @@ module DGM.OracleHandle
   , withOracle
     -- * Handle-gated oracle operations
   , proposeMutationH
+  , proposeMutationEnrichedH
   , scoreMutationsH
   ) where
 
 import Data.Text (Text)
 
 import DGM.HsAST (HsMutation)
-import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, scoreAndRankMutations)
+import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, proposeMutationEnriched, scoreAndRankMutations)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Capability token
@@ -99,6 +100,16 @@ proposeMutationH (OracleHandle_ env) = proposeMutation env
 -- Returns each mutation paired with the oracle's confidence score in @[0,1]@.
 -- Like 'proposeMutationH', the 'OracleHandle' argument proves the caller
 -- explicitly requested oracle IO.
+-- | Propose a mutation using an enriched (GHC-guided) prompt.
+--
+-- Like 'proposeMutationH' but takes a pre-built enriched prompt that
+-- includes GHC-verified safe removals.
+proposeMutationEnrichedH
+  :: OracleHandle
+  -> FilePath -> Text -> Text   -- ^ file path, source, enriched prompt
+  -> IO (Either Text HsMutation)
+proposeMutationEnrichedH (OracleHandle_ env) = proposeMutationEnriched env
+
 scoreMutationsH
   :: OracleHandle
   -> [HsMutation]

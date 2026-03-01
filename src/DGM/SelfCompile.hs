@@ -9,6 +9,8 @@ module DGM.SelfCompile
     -- * Running the test suite
   , compileSelf
   , testSelf
+    -- * Build pre-flight
+  , buildPreflight
     -- * Scoring
   , scoreCompileResult
   , enrichScore
@@ -73,6 +75,20 @@ compileSelf = runCabal ["build"]
 -- test failures.
 testSelf :: IO CompileResult
 testSelf = runCabal ["test", "--test-show-details=direct"]
+
+-- | Run @cabal build@ (no tests, no -Wall) as a quick type-check pre-flight.
+--
+-- Returns @Right ()@ on success, @Left errorText@ on any compilation error.
+-- 60-second timeout.  Catches type errors in ~5s instead of the full test
+-- suite's ~30-120s, short-circuiting bad mutations early.
+buildPreflight :: IO (Either Text ())
+buildPreflight = do
+  result <- runCabal ["build"]
+  case result of
+    CompileSuccess {} -> return (Right ())
+    CompileFailure errs phase ->
+      return (Left ("Build pre-flight failed (" <> T.pack (show phase) <> "): "
+                    <> T.take 200 errs))
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Scoring

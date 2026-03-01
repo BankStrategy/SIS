@@ -63,13 +63,14 @@ import DGM.HsAST (HsMutation(..), HsModule, applyHsMutation, printHsModule)
 import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation)
 import DGM.Liquid (verifyWithLiquid, LiquidResult(..))
 import DGM.SelfCompile
-  ( testSelf, scoreCompileResult, enrichScore
+  ( testSelf, scoreCompileResult, enrichScore, buildPreflight
   , SelfModTxn(..), withSelfModTxn
   )
 import DGM.ModGraph (buildModuleGraph, removesExportedName)
 import DGM.Rewriting (DynamicRule(..), applyDynamicRules)
 import DGM.HintBridge (HintEnv, newHintEnv, evalRuleCandidate)
 import DGM.Oracle (newOracleEnv, MutationContext(..))
+import DGM.OracleContext (collectGhcWarnings)
 import DGM.Verification (verifyEquivalence, EquivSpec(..))
 import DGM.RuleMiner (minePatterns, boostByFile, evictStaleRules)
 import DGM.NatLang (EvolutionGoal, applyGoal, describeGoal)
@@ -301,7 +302,9 @@ runSelfModCycle cfg = do
                           , mcRecentSuccesses = recent
                           , mcEvolutionGoal   = mGoalText
                           }
-  candidates <- proposeSelfMutations st fps mCtx
+  -- Collect GHC warnings (runs cabal build -Wall, ~5s).
+  warnings <- collectGhcWarnings
+  candidates <- proposeSelfMutations st fps mCtx modGraph warnings
   -- Reject mutations that would remove exported names (pre-write safety).
   let safeCandiates = filter (\(_, mut, m) -> not (removesExportedName mut m)) candidates
   -- Mine archive for successful mutation patterns and boost ranking.
@@ -424,47 +427,52 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
     case wr of
       Left writeErr -> return (Left ("Write failed: " <> writeErr))
       Right () -> do
-        -- ── LiquidHaskell pre-flight (pillar II formal verification) ─────
-        lhResult <- verifyWithLiquid (stateRepoRoot st) fp
-        let lhText = case lhResult of
-              LiquidSafe       -> "SAFE"
-              LiquidUnsafe det -> "UNSAFE: " <> det
-              LiquidError  msg -> "ERROR: "  <> msg
-        writeIORef lhRef (Just lhText)
-        case lhResult of
-          LiquidUnsafe details ->
-            return (Left ("LiquidHaskell UNSAFE: " <> details))
-          LiquidError msg ->
-            return (Left ("LiquidHaskell error: " <> msg))
-          LiquidSafe -> do
-            -- ── SBV equivalence check (pillar II formal verification) ────
-            let spec = EquivSpec
-                         { esName          = "selfmod-equiv"
-                         , esOriginal      = bootstrapExpr
-                         , esMutated       = bootstrapExpr
-                         , esInputDomain   = []
-                         , esSymbolicBound = 0
-                         }
-            sbvResult <- verifyEquivalence spec
-            let sbvText = case sbvResult of
-                  Verified _    -> "QED"
-                  Falsifiable _ -> "Falsifiable"
-                  VTimeout    _ -> "Timeout"
-            writeIORef sbvRef (Just sbvText)
-            case sbvResult of
-              Falsifiable ce -> do
-                atomically (modifyTVar' (stateSbvQueue st) (ce:))
-                return (Left "SBV Falsifiable: counter-example enqueued")
-              VTimeout msg ->
-                return (Left ("SBV timeout: " <> msg))
-              Verified _ -> do
-                cr <- testSelf
-                let base = scoreCompileResult cr
-                    sc   = enrichScore base origLen mutLen (Just lhText)
-                writeIORef scoreRef sc
-                if sc >= 1.0
-                  then return (Right ())
-                  else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
+        -- ── Build pre-flight: catch type errors before expensive pipeline ─
+        preflight <- buildPreflight
+        case preflight of
+          Left buildErr -> return (Left ("Build pre-flight: " <> buildErr))
+          Right () -> do
+            -- ── LiquidHaskell pre-flight (pillar II formal verification) ─
+            lhResult <- verifyWithLiquid (stateRepoRoot st) fp
+            let lhText = case lhResult of
+                  LiquidSafe       -> "SAFE"
+                  LiquidUnsafe det -> "UNSAFE: " <> det
+                  LiquidError  msg -> "ERROR: "  <> msg
+            writeIORef lhRef (Just lhText)
+            case lhResult of
+              LiquidUnsafe details ->
+                return (Left ("LiquidHaskell UNSAFE: " <> details))
+              LiquidError msg ->
+                return (Left ("LiquidHaskell error: " <> msg))
+              LiquidSafe -> do
+                -- ── SBV equivalence check (pillar II formal verification) ─
+                let spec = EquivSpec
+                             { esName          = "selfmod-equiv"
+                             , esOriginal      = bootstrapExpr
+                             , esMutated       = bootstrapExpr
+                             , esInputDomain   = []
+                             , esSymbolicBound = 0
+                             }
+                sbvResult <- verifyEquivalence spec
+                let sbvText = case sbvResult of
+                      Verified _    -> "QED"
+                      Falsifiable _ -> "Falsifiable"
+                      VTimeout    _ -> "Timeout"
+                writeIORef sbvRef (Just sbvText)
+                case sbvResult of
+                  Falsifiable ce -> do
+                    atomically (modifyTVar' (stateSbvQueue st) (ce:))
+                    return (Left "SBV Falsifiable: counter-example enqueued")
+                  VTimeout msg ->
+                    return (Left ("SBV timeout: " <> msg))
+                  Verified _ -> do
+                    cr <- testSelf
+                    let base = scoreCompileResult cr
+                        sc   = enrichScore base origLen mutLen (Just lhText)
+                    writeIORef scoreRef sc
+                    if sc >= 1.0
+                      then return (Right ())
+                      else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
 
   score   <- readIORef scoreRef
   mLhText <- readIORef lhRef

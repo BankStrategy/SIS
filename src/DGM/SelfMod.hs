@@ -53,7 +53,8 @@ import DGM.HsAST
 import DGM.SafetyKernel
 import DGM.ModGraph (ModuleGraph, moduleImpact)
 import DGM.Oracle (newOracleEnv, MutationContext)
-import DGM.OracleHandle (withOracle, proposeMutationH)
+import DGM.OracleHandle (withOracle, proposeMutationH, proposeMutationEnrichedH)
+import DGM.OracleContext (GhcWarning, buildModuleContext, buildEnrichedPrompt)
 import DGM.Reversal (Invertible(..), TypedTxn(..))
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -110,8 +111,10 @@ proposeSelfMutations
   :: AgentState
   -> [FilePath]
   -> Maybe MutationContext  -- ^ Archive context to guide the oracle.
+  -> ModuleGraph            -- ^ Module dependency graph.
+  -> [GhcWarning]           -- ^ GHC warnings from @cabal build -Wall@.
   -> IO [(FilePath, HsMutation, HsModule)]
-proposeSelfMutations st fps mCtx = do
+proposeSelfMutations st fps mCtx modGraph warnings = do
   blacklist  <- atomically $ readTVar (stateMutationBlacklist st)
   mOracleEnv <- newOracleEnv
   perFile    <- mapM (\fp -> do
@@ -134,15 +137,32 @@ proposeSelfMutations st fps mCtx = do
             oracleMuts <- case mOracleEnv of
               Nothing  -> return []
               Just env -> do
-                let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
-                eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
-                case eOrMut of
-                  Left err -> do
-                    unless ("build with -f+with-oracle" `T.isInfixOf` err) $
-                      hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
-                    return []
-                  Right om ->
-                    return (filter notBlacklisted [(fp, om, m)])
+                -- Build module context for enriched prompting.
+                let modCtx = buildModuleContext modGraph warnings fp src
+                    mEnrichedPrompt = buildEnrichedPrompt modCtx mCtx
+                case mEnrichedPrompt of
+                  -- GHC warnings available: use enriched prompt path.
+                  Just enrichedPrompt -> do
+                    eOrMut <- withOracle env $ \h ->
+                      proposeMutationEnrichedH h fp src enrichedPrompt
+                    case eOrMut of
+                      Left err -> do
+                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                          hPutStrLn stderr ("DGM.SelfMod: oracle-enriched error for " ++ fp ++ ": " ++ T.unpack err)
+                        return []
+                      Right om ->
+                        return (filter notBlacklisted [(fp, om, m)])
+                  -- No warnings for this file: fall back to standard prompt.
+                  Nothing -> do
+                    let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
+                    eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
+                    case eOrMut of
+                      Left err -> do
+                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                          hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                        return []
+                      Right om ->
+                        return (filter notBlacklisted [(fp, om, m)])
             return (oracleMuts ++ heuristicMuts)) fps
   return (concat perFile)
 
