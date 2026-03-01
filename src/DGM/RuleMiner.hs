@@ -19,7 +19,7 @@ module DGM.RuleMiner
   , evictStaleRules
   ) where
 
-import Data.List (sortBy, groupBy, nub)
+import Data.List (sortBy, groupBy, nub, sortOn)
 import Data.Ord (Down(..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -69,7 +69,7 @@ minePatterns entries =
 
     -- Sort then group by prefix so 'groupBy' produces contiguous buckets.
     sorted :: [(Text, ArchiveEntry)]
-    sorted = sortBy (\a b -> compare (fst a) (fst b)) tagged
+    sorted = sortOn fst tagged
 
     grouped :: [[(Text, ArchiveEntry)]]
     grouped = groupBy (\a b -> fst a == fst b) sorted
@@ -174,4 +174,4 @@ evictStaleRules limit rules
   | length rules <= limit = rules
   | otherwise =
       let pruned = filter (\r -> drScore r > 0) rules
-      in take limit $ sortBy (\a b -> compare (Down (drScore a)) (Down (drScore b))) pruned
+      in take limit $ sortOn (Down . drScore) pruned
