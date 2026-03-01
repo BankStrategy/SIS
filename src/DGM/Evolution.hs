@@ -46,7 +46,7 @@ import qualified Data.Text as T
 import System.Random (randomRIO)
 import DGM.AST
 import DGM.Types
-import DGM.Rewriting (generateMutations, defaultRules)
+import DGM.Rewriting (generateMutations, evolutionRules)
 import DGM.Verification (runVerification, defaultVerifConfig)
 import DGM.Archive (addEntry)
 
@@ -89,7 +89,7 @@ unfoldHypotheses maxDepth = ana coalg . flip HypothesisSeed maxDepth
     coalg (HypothesisSeed expr depth)
       | depth <= 0 = LeafH expr
       | otherwise  =
-          let mutations = generateMutations defaultRules expr
+          let mutations = generateMutations evolutionRules expr
           in  case mutations of
                 [] -> LeafH expr
                 ms -> BranchH expr (snd (head ms))

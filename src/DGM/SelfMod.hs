@@ -117,29 +117,33 @@ proposeSelfMutations st fps mCtx = do
   perFile    <- mapM (\fp -> do
     -- Read raw source first, then parse from text to avoid GHC API file locks.
     src <- TIO.readFile fp
-    result <- parseHsText src
-    case result of
-      Left err -> do
-        hPutStrLn stderr ("DGM.SelfMod: parse error in " ++ fp ++ ": " ++ T.unpack err)
-        return []
-      Right m -> do
-        let notBlacklisted (f, mut, _) =
-              (f, hmDescription mut) `Set.notMember` blacklist
-            heuristicMuts = filter notBlacklisted
-              [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
-        oracleMuts <- case mOracleEnv of
-          Nothing  -> return []
-          Just env -> do
-            let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
-            eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
-            case eOrMut of
-              Left err -> do
-                unless ("build with -f+with-oracle" `T.isInfixOf` err) $
-                  hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
-                return []
-              Right om ->
-                return (filter notBlacklisted [(fp, om, m)])
-        return (oracleMuts ++ heuristicMuts)) fps
+    -- Skip CPP files: ghc-exactprint cannot parse #ifdef/#endif directives.
+    if "{-# LANGUAGE CPP #-}" `T.isInfixOf` src
+      then return []
+      else do
+        result <- parseHsText src
+        case result of
+          Left err -> do
+            hPutStrLn stderr ("DGM.SelfMod: parse error in " ++ fp ++ ": " ++ T.unpack err)
+            return []
+          Right m -> do
+            let notBlacklisted (f, mut, _) =
+                  (f, hmDescription mut) `Set.notMember` blacklist
+                heuristicMuts = filter notBlacklisted
+                  [(fp, mut, m) | mut <- collectHsMutations defaultHsRules m]
+            oracleMuts <- case mOracleEnv of
+              Nothing  -> return []
+              Just env -> do
+                let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
+                eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
+                case eOrMut of
+                  Left err -> do
+                    unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                      hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                    return []
+                  Right om ->
+                    return (filter notBlacklisted [(fp, om, m)])
+            return (oracleMuts ++ heuristicMuts)) fps
   return (concat perFile)
 
 -- | Sort mutation candidates for selection.

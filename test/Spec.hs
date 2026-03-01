@@ -164,6 +164,30 @@ rewritingTests = testGroup "DGM.Rewriting"
       -- (1 + 2) has 3 nodes: the BinOp root, lit 1, lit 2
       let e = binop "+" (lit 1) (lit 2)
       length (subtermsWithCtx e) @?= 3
+
+  -- ── Expansion rules ─────────────────────────────────────────────────────
+
+  , testCase "evolutionRules generates candidates on bootstrapExpr" $ do
+      -- With expansion rules, bootstrapExpr should no longer be a fixed point.
+      let muts = generateMutations evolutionRules bootstrapExpr
+      assertBool "expansion rules should produce mutations on bootstrapExpr"
+        (length muts >= 1)
+
+  , testCase "commute swaps operands of +" $ do
+      -- (y + x) where "y" > "x" lexicographically → commute fires
+      let e = binop "+" (var "y") (var "x")
+          muts = generateMutations [commute] e
+          targets = map (mutationTarget . snd) muts
+      ("commute" `elem` targets) @?= True
+
+  , testCase "identityIntro + identityElim round-trip" $ do
+      -- Apply identity-intro then identity-elim: should recover original.
+      let e = binop "+" (var "a") (var "b")
+      case ruleApply identityIntro e of
+        Nothing -> assertFailure "identity-intro should fire on (a + b)"
+        Just expanded -> do
+          let (result, _, _) = rewrite defaultConfig [identityElim, constantFold] expanded
+          prettyExpr result @?= prettyExpr e
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -841,6 +865,57 @@ hsASTTests = testGroup "DGM.HsAST"
       case simplifyIfTransform src of
         Left _  -> pure ()  -- expected: condition is not constant
         Right _ -> assertFailure "should not fire on non-constant condition"
+
+  -- ── unusedImportRule correctness ───────────────────────────────────────────
+
+  , testCase "unusedImportRule: whole-word matching (Map vs MapStrict)" $ do
+      -- "Map" should NOT be flagged as unused when it appears as a whole word.
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "import Data.Map.Strict (Map)"
+            , ""
+            , "foo :: Map String Int"
+            , "foo = undefined"
+            ]
+      parseResult <- parseHsText src
+      case parseResult of
+        Left err -> assertFailure ("parseHsText failed: " <> T.unpack err)
+        Right m  -> do
+          let muts = collectHsMutations [unusedImportRule] m
+          -- Map is used in the type signature — rule should NOT fire.
+          null muts @?= True
+
+  , testCase "unusedImportRule: re-export in module header is not unused" $ do
+      let src = T.unlines
+            [ "module Foo (bar) where"
+            , ""
+            , "import Data.List (sort)"
+            , ""
+            , "bar = sort [3,1,2]"
+            ]
+      parseResult <- parseHsText src
+      case parseResult of
+        Left err -> assertFailure ("parseHsText failed: " <> T.unpack err)
+        Right m  -> do
+          let muts = collectHsMutations [unusedImportRule] m
+          -- sort is used in the body — rule should NOT fire.
+          null muts @?= True
+
+  , testCase "unusedImportRule: genuinely unused import is removed" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "import Data.List (nub)"
+            , ""
+            , "bar = 42"
+            ]
+      parseResult <- parseHsText src
+      case parseResult of
+        Left err -> assertFailure ("parseHsText failed: " <> T.unpack err)
+        Right m  -> do
+          let muts = collectHsMutations [unusedImportRule] m
+          length muts >= 1 @?= True
   ]
 
 -- | Drop trailing newline characters for lenient round-trip comparison.
@@ -877,23 +952,25 @@ selfModTests = testGroup "DGM.SelfMod"
       let node = exprToASTNode "n" (lit 1)
       st  <- newAgentState node
       fps <- discoverSources
-      candidates <- proposeSelfMutations st fps
+      candidates <- proposeSelfMutations st fps Nothing
       length candidates >= 1 @?= True
 
   , testCase "rankMutations is a permutation of the input list" $ do
       let node = exprToASTNode "n" (lit 1)
       st  <- newAgentState node
       fps <- discoverSources
-      candidates <- proposeSelfMutations st fps
-      let ranked = rankMutations candidates
+      mg  <- buildModuleGraph fps
+      candidates <- proposeSelfMutations st fps Nothing
+      let ranked = rankMutations mg candidates
       length ranked @?= length candidates
 
   , testCase "rankMutations preserves all candidates (no drops)" $ do
       let node = exprToASTNode "n" (lit 1)
       st  <- newAgentState node
       fps <- discoverSources
-      candidates <- proposeSelfMutations st fps
-      let ranked = rankMutations candidates
+      mg  <- buildModuleGraph fps
+      candidates <- proposeSelfMutations st fps Nothing
+      let ranked = rankMutations mg candidates
       -- Every original candidate's mutation description should appear in ranked.
       let origDescs  = map (\(_, m, _) -> hmDescription m) candidates
           rankedDescs = map (\(_, m, _) -> hmDescription m) ranked

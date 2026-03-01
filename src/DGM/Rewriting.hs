@@ -13,6 +13,13 @@ module DGM.Rewriting
     RewriteRule(..)
   , RuleSet
   , defaultRules
+  , evolutionRules
+    -- * Individual rules (for testing)
+  , constantFold
+  , identityElim
+  , identityIntro
+  , letIntro
+  , commute
     -- * Dynamic (in-memory) rules — hint track
   , DynamicRule(..)
   , applyDynamicRules
@@ -64,7 +71,10 @@ data SizeOrdering
 
 type RuleSet = [RewriteRule]
 
--- | Default algebraic simplification rules.
+-- | Default algebraic simplification rules (shrinking / convergent).
+--
+-- Safe for the 'rewrite' engine — all rules either strictly shrink the term
+-- or are idempotent, so repeated application converges to a fixed point.
 defaultRules :: RuleSet
 defaultRules =
   [ constantFold
@@ -72,6 +82,18 @@ defaultRules =
   , etaReduce
   , deadLetterElim
   , ifConstant
+  ]
+
+-- | Extended rule set for evolutionary candidate generation.
+--
+-- Includes the convergent 'defaultRules' plus expansion / restructuring
+-- rules that create new opportunities for shrinking.  Use with
+-- 'generateMutations' (not 'rewrite') to avoid infinite loops.
+evolutionRules :: RuleSet
+evolutionRules = defaultRules ++
+  [ identityIntro
+  , letIntro
+  , commute
   ]
 
 -- | Constant folding: evaluate binary operations on literals at compile time.
@@ -143,6 +165,98 @@ ifConstant = RewriteRule
       _                                  -> Nothing
   , ruleSizeProof = Just StrictlySmaller
   }
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Expansion / restructuring rules
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Identity introduction: wrap @e + 0@ around a @BinOpF@ with @+@ or @-@,
+-- or @e * 1@ around @*@.  Creates opportunities for 'identityElim' and
+-- 'constantFold' on subsequent passes.
+--
+-- Only fires on @BinOpF@ nodes where neither operand is already a literal 0/1
+-- (to prevent infinite expansion loops).
+identityIntro :: RewriteRule
+identityIntro = RewriteRule
+  { ruleName        = "identity-intro"
+  , ruleDescription = "Wrap binary expression in arithmetic identity"
+  , ruleApply       = \case
+      e@(Fix (BinOpF op l r))
+        | op `elem` ["+", "-"]
+        , not (isLitVal 0 l), not (isLitVal 0 r)
+        -> Just (binop op e (lit 0))
+        | op == "*"
+        , not (isLitVal 1 l), not (isLitVal 1 r)
+        -> Just (binop "*" e (lit 1))
+      _ -> Nothing
+  , ruleSizeProof = Nothing  -- expansion rule: no size proof
+  }
+
+-- | Let introduction: lift a duplicated subexpression into a let binding.
+--
+-- When a @BinOpF@ has identical left and right operands, introduces
+-- @let x = operand in op x x@.  The 'deadLetterElim' rule validates this
+-- by removing dead lets if the binding turns out unused after further rewrites.
+letIntro :: RewriteRule
+letIntro = RewriteRule
+  { ruleName        = "let-intro"
+  , ruleDescription = "Lift duplicated subexpression into let binding"
+  , ruleApply       = \case
+      Fix (BinOpF op l r)
+        | l == r
+        , not (isSimpleLitOrVar l)  -- don't lift trivial expressions
+        -> Just (letE "x" l (binop op (var "x") (var "x")))
+      _ -> Nothing
+  , ruleSizeProof = Nothing  -- restructuring rule: no size proof
+  }
+
+-- | Commutativity: swap operands of commutative operators (@+@, @*@).
+--
+-- Not shrinking, not expanding — creates a different normal form so
+-- subsequent rules may find new opportunities.  Only fires when the left
+-- operand is "greater" than the right (lexicographic on pretty-print) to
+-- ensure the rule does not oscillate indefinitely.
+commute :: RewriteRule
+commute = RewriteRule
+  { ruleName        = "commute"
+  , ruleDescription = "Swap operands of commutative binary operator"
+  , ruleApply       = \case
+      Fix (BinOpF op l r)
+        | op `elem` ["+", "*"]
+        , prettyExpr' l > prettyExpr' r   -- canonical ordering prevents loops
+        -> Just (binop op r l)
+      _ -> Nothing
+  , ruleSizeProof = Just WeaklySmaller  -- same size
+  }
+
+-- | Check if an expression is a literal with a specific value.
+isLitVal :: Int -> Expr -> Bool
+isLitVal n (Fix (LitF m)) = n == m
+isLitVal _ _               = False
+
+-- | Check if an expression is a simple literal or variable (not worth lifting).
+isSimpleLitOrVar :: Expr -> Bool
+isSimpleLitOrVar (Fix (LitF _))  = True
+isSimpleLitOrVar (Fix (BoolF _)) = True
+isSimpleLitOrVar (Fix (VarF _))  = True
+isSimpleLitOrVar (Fix UnitF)     = True
+isSimpleLitOrVar _               = False
+
+-- | Quick pretty-print for ordering (reuses the catamorphism from AST).
+prettyExpr' :: Expr -> Text
+prettyExpr' = cata prettyAlg
+  where
+    prettyAlg :: ExprF Text -> Text
+    prettyAlg = \case
+      LitF  n     -> T.pack (show n)
+      BoolF b     -> if b then "True" else "False"
+      VarF  v     -> v
+      AppF  f x   -> "(" <> f <> " " <> x <> ")"
+      LamF  v b   -> "(\\" <> v <> " -> " <> b <> ")"
+      LetF  v e b -> "let " <> v <> " = " <> e <> " in " <> b
+      IfF   p t f -> "if " <> p <> " then " <> t <> " else " <> f
+      BinOpF op l r -> "(" <> l <> " " <> op <> " " <> r <> ")"
+      UnitF       -> "()"
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Engine

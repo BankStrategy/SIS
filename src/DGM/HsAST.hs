@@ -30,6 +30,7 @@ module DGM.HsAST
   , HsRuleSet
   , defaultHsRules
     -- * Individual rules
+  , unusedImportRule
   , addHaddockRule
   , addHaddockTransform
   , addTypeAnnotationRule
@@ -294,14 +295,9 @@ unusedImportRule = HsMutation
 unusedImportTransform :: Text -> Either Text Text
 unusedImportTransform src =
   let ls          = T.lines src
-      -- Collect all import lines regardless of position (the module declaration
-      -- precedes imports, so a prefix-based split would find nothing).
-      importLines = filter isImportLine ls
-      -- Body: everything that is not an import line (module decl, definitions).
-      body        = T.unlines (filter (not . isImportLine) ls)
       -- Identify import lines with explicit lists where none of the
-      -- listed names appears in the body.
-      toRemove    = filter (isUnusedExplicitImport body) importLines
+      -- listed names appears anywhere else in the source.
+      toRemove    = filter (isUnusedExplicitImport ls) ls
   in  if null toRemove
       then Left "no unused explicit imports detected"
       else Right $ T.unlines $ filter (`notElem` toRemove) ls
@@ -310,15 +306,22 @@ unusedImportTransform src =
     isImportLine l = "import " `T.isPrefixOf` T.stripStart l
 
     -- | True if this line is an explicit import (@import M (names)@) AND
-    -- none of the listed bare names appear in the file body.
-    isUnusedExplicitImport :: Text -> Text -> Bool
-    isUnusedExplicitImport body line =
+    -- none of the listed bare names appear anywhere in the source (excluding
+    -- the import line itself).  Uses whole-word matching to avoid false
+    -- positives like "Map" matching "MapStrict".
+    isUnusedExplicitImport :: [Text] -> Text -> Bool
+    isUnusedExplicitImport allLines line =
       case extractExplicitNames line of
         Nothing    -> False  -- not an explicit import
         Just []    -> False  -- empty list — keep for side effects
-        Just names -> all (\n ->
-          let base = T.strip (T.takeWhile (/= '(') n)
-          in  T.null base || not (base `T.isInfixOf` body)) names
+        Just names ->
+          -- Check each name against the entire source *excluding* this
+          -- specific import line.  This catches re-exports in the module
+          -- header, qualified usage in other imports, etc.
+          let rest = T.unlines (filter (/= line) allLines)
+          in  all (\n ->
+                let base = T.strip (T.takeWhile (/= '(') n)
+                in  T.null base || countWholeWord base rest == 0) names
 
     -- | Extract the names from @import M (f, g, ...)@.
     -- Returns @Nothing@ for qualified / hiding / wildcard imports.
@@ -671,6 +674,10 @@ collectHsMutations _ _ = []
 -- | Empty rule set — exactprint disabled.
 defaultHsRules :: HsRuleSet
 defaultHsRules = []
+
+-- | Stub — always Left.
+unusedImportRule :: HsMutation
+unusedImportRule = HsMutation "remove unused explicit imports" (\_ -> Left stubMsg)
 
 -- | Stub — always Left.
 addHaddockRule :: HsMutation

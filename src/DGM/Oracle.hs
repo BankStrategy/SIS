@@ -155,7 +155,9 @@ oracleSystemPrompt =
   "simplifying expressions, adding type signatures, improving documentation, " <>
   "reducing code duplication, and eliminating dead code. " <>
   "Output ONLY the diff, starting with --- lines and ending after the last " <>
-  "+++ block. Do not include any explanation or markdown fences."
+  "+++ block. Do not include any explanation or markdown fences. " <>
+  "Do not include line numbers or the numbered source lines in your diff. " <>
+  "Use the original source lines exactly as they appear (preserving indentation)."
 
 -- | Build the user-role prompt for a mutation request.
 buildMutationPrompt :: FilePath -> Text -> [Text] -> Maybe MutationContext -> Text
@@ -362,7 +364,7 @@ parseDiffResponse content =
   in  if null nonEmpty
         then Left "oracle: no hunks found in diff response"
         else Right HsMutation
-               { hmDescription = "oracle-diff: " <> T.take 50 (T.strip content)
+               { hmDescription = "oracle-diff: " <> T.take 50 (T.strip stripped)
                , hmTransform   = applyAllHunks nonEmpty
                }
   where
@@ -380,17 +382,33 @@ applyLineDiff removes adds src =
   in  fmap T.unlines $ applyHunk hunk (T.lines src)
 
 -- | Find the first index of @needle@ as a contiguous sublist of @haystack@.
--- Normalizes trailing whitespace before comparing.
+-- Two-pass strategy: first tries trailing-whitespace-normalized match, then
+-- falls back to a loose match that strips all leading/trailing whitespace
+-- (handles LLM diffs with slightly different indentation).
 findSubseq :: [Text] -> [Text] -> Maybe Int
-findSubseq needle haystack = go 0 haystack
+findSubseq needle haystack =
+  case findSubseqExact needle haystack of
+    Just idx -> Just idx
+    Nothing  -> findSubseqLoose needle haystack
   where
-    n = length needle
-    norm = T.stripEnd
-    needleNorm = map norm needle
-    go _ [] = Nothing
-    go i xs
-      | map norm (take n xs) == needleNorm = Just i
-      | otherwise = go (i + 1) (tail xs)
+    findSubseqExact ns hs = go 0 hs
+      where
+        n' = length ns
+        normE = T.stripEnd
+        nsNorm = map normE ns
+        go _ [] = Nothing
+        go i xs
+          | map normE (take n' xs) == nsNorm = Just i
+          | otherwise = go (i + 1) (tail xs)
+    findSubseqLoose ns hs = go 0 hs
+      where
+        n' = length ns
+        normL = T.strip
+        nsNorm = map normL ns
+        go _ [] = Nothing
+        go i xs
+          | map normL (take n' xs) == nsNorm = Just i
+          | otherwise = go (i + 1) (tail xs)
 
 -- | Strip markdown fences (@```diff@, @```haskell@, @```@ etc.) from LLM output.
 stripMarkdownFences :: Text -> Text
