@@ -38,8 +38,8 @@ module DGM.Evolution
 
 import Control.Concurrent.STM
 import Control.Monad (when)
-import Data.List (maximumBy, sortBy)
-import Data.Ord (comparing, Down(..))
+import Data.List (maximumBy)
+import Data.Ord (comparing)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
