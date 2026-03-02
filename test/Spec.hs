@@ -2733,6 +2733,13 @@ crossFileRoutingTests = testGroup "Cross-file routing"
       -- so it's skipped; +++ b/ is found
       extractDiffTargetPath ls @?= Just "test/NewFile.hs"
 
+  , testCase "extractDiffTargetPath: handles headers without a/b prefix" $ do
+      let ls = [ "--- test/Spec.hs"
+               , "+++ test/Spec.hs"
+               , "@@ -10,6 +10,14 @@"
+               ]
+      extractDiffTargetPath ls @?= Just "test/Spec.hs"
+
   -- ── isTestPath ─────────────────────────────────────────────────────────────
   , testCase "isTestPath: True for test/Spec.hs" $
       isTestPath "test/Spec.hs" @?= True

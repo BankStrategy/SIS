@@ -762,11 +762,11 @@ parseDiffResponseWithPath content =
 
 -- | Extract the target file path from unified diff header lines.
 --
--- Scans for @+++ b/<path>@ first (preferred), then falls back to
--- @--- a/<path>@.  Skips @/dev/null@ paths.
+-- Scans for @+++ b/<path>@ first (preferred), then @+++ <path>@ (no prefix),
+-- then @--- a/<path>@, then @--- <path>@ (no prefix).  Skips @/dev/null@ paths.
 extractDiffTargetPath :: [Text] -> Maybe FilePath
 extractDiffTargetPath ls =
-  -- Prefer +++ b/ (the "to" file)
+  -- Prefer +++ (the "to" file), with or without b/ prefix
   case mapMaybe extractPlusPath ls of
     (p:_) -> Just p
     []    -> case mapMaybe extractMinusPath ls of
@@ -777,11 +777,17 @@ extractDiffTargetPath ls =
       | "+++ b/" `T.isPrefixOf` l =
           let raw = T.unpack (T.stripEnd (T.drop 6 l))
           in if raw == "/dev/null" then Nothing else Just raw
+      | "+++ " `T.isPrefixOf` l =
+          let raw = T.unpack (T.stripEnd (T.drop 4 l))
+          in if raw == "/dev/null" || raw == "b" then Nothing else Just raw
       | otherwise = Nothing
     extractMinusPath l
       | "--- a/" `T.isPrefixOf` l =
           let raw = T.unpack (T.stripEnd (T.drop 6 l))
           in if raw == "/dev/null" then Nothing else Just raw
+      | "--- " `T.isPrefixOf` l =
+          let raw = T.unpack (T.stripEnd (T.drop 4 l))
+          in if raw == "/dev/null" || raw == "a" then Nothing else Just raw
       | otherwise = Nothing
 
 -- | True when @fp@ contains a @\"test\"@ path component.
