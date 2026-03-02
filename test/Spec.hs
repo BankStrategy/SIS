@@ -65,6 +65,7 @@ tests = testGroup "DGM"
   , enrichScoreV2Tests
   , liquidAnnotationTests
   , failureReasonTests
+  , crossFileRoutingTests
 #ifdef WITH_SQLITE
   , sqliteArchiveTests
 #endif
@@ -2689,4 +2690,121 @@ groupRelatedModulesTests = testGroup "DGM.SelfMod.groupRelatedModules"
   , testCase "groupRelatedModules: empty file list returns empty" $ do
       let mg = emptyModuleGraph
       groupRelatedModules mg [] @?= []
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Cross-file routing tests (Gödel-complete self-modification)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+crossFileRoutingTests :: TestTree
+crossFileRoutingTests = testGroup "Cross-file routing"
+  [ -- ── extractDiffTargetPath ────────────────────────────────────────────────
+    testCase "extractDiffTargetPath: extracts path from +++ b/ header" $ do
+      let ls = [ "--- a/test/Spec.hs"
+               , "+++ b/test/Spec.hs"
+               , "@@ -10,3 +10,5 @@"
+               ]
+      extractDiffTargetPath ls @?= Just "test/Spec.hs"
+
+  , testCase "extractDiffTargetPath: prefers +++ over ---" $ do
+      let ls = [ "--- a/src/DGM/Foo.hs"
+               , "+++ b/test/Spec.hs"
+               ]
+      extractDiffTargetPath ls @?= Just "test/Spec.hs"
+
+  , testCase "extractDiffTargetPath: falls back to --- a/ when no +++" $ do
+      let ls = [ "--- a/src/DGM/Bar.hs"
+               , "@@ -1,3 +1,5 @@"
+               ]
+      extractDiffTargetPath ls @?= Just "src/DGM/Bar.hs"
+
+  , testCase "extractDiffTargetPath: returns Nothing for no headers" $ do
+      let ls = [ "@@ -1,3 +1,5 @@"
+               , "-old line"
+               , "+new line"
+               ]
+      extractDiffTargetPath ls @?= Nothing
+
+  , testCase "extractDiffTargetPath: skips /dev/null" $ do
+      let ls = [ "--- /dev/null"
+               , "+++ b/test/NewFile.hs"
+               ]
+      -- /dev/null is in --- a/ position but doesn't start with "--- a/"
+      -- so it's skipped; +++ b/ is found
+      extractDiffTargetPath ls @?= Just "test/NewFile.hs"
+
+  -- ── isTestPath ─────────────────────────────────────────────────────────────
+  , testCase "isTestPath: True for test/Spec.hs" $
+      isTestPath "test/Spec.hs" @?= True
+
+  , testCase "isTestPath: True for test/Unit/Foo.hs" $
+      isTestPath "test/Unit/Foo.hs" @?= True
+
+  , testCase "isTestPath: False for src/DGM/Oracle.hs" $
+      isTestPath "src/DGM/Oracle.hs" @?= False
+
+  , testCase "isTestPath: False for testing-notes.md" $
+      isTestPath "testing-notes.md" @?= False
+
+  -- ── countTestCases ─────────────────────────────────────────────────────────
+  , testCase "countTestCases: counts testCase and testProperty" $ do
+      let src = T.unlines
+            [ "testGroup \"G\""
+            , "  [ testCase \"a\" $ return ()"
+            , "  , testCase \"b\" $ return ()"
+            , "  , testProperty \"c\" $ \\x -> x == x"
+            , "  ]"
+            ]
+      countTestCases src @?= 4  -- 1 testGroup + 2 testCase + 1 testProperty
+
+  , testCase "countTestCases: zero for empty text" $
+      countTestCases "" @?= 0
+
+  , testCase "countTestCases: zero for source with no tests" $
+      countTestCases "module Foo where\n\nfoo = 42\n" @?= 0
+
+  -- ── validateMaintainTests ──────────────────────────────────────────────────
+  , testCase "validateMaintainTests: accepts added tests" $ do
+      let original = "  testCase \"a\" $ return ()\n"
+          mutated  = "  testCase \"a\" $ return ()\n  testCase \"b\" $ return ()\n"
+      validateMaintainTests original mutated @?= Right ()
+
+  , testCase "validateMaintainTests: rejects removed tests" $ do
+      let original = "  testCase \"a\" $ return ()\n  testCase \"b\" $ return ()\n"
+          mutated  = "  testCase \"a\" $ return ()\n"
+      case validateMaintainTests original mutated of
+        Left _  -> return ()
+        Right _ -> assertFailure "Expected Left for removed test"
+
+  , testCase "validateMaintainTests: accepts same count" $ do
+      let src = "  testCase \"a\" $ return ()\n"
+      validateMaintainTests src src @?= Right ()
+
+  -- ── stripMarkdownFences (improved) ─────────────────────────────────────────
+  , testCase "stripMarkdownFences: strips fences" $ do
+      let input = "```diff\n-old\n+new\n```\n"
+      T.isInfixOf "```" (stripMarkdownFences input) @?= False
+
+  , testCase "stripMarkdownFences: handles preamble before fence" $ do
+      let input = "Here is the diff:\n```diff\n-old\n+new\n```\n"
+      T.isInfixOf "```" (stripMarkdownFences input) @?= False
+      T.isInfixOf "Here is" (stripMarkdownFences input) @?= False
+
+  , testCase "stripMarkdownFences: handles leading blank lines" $ do
+      let input = "\n\n```diff\n-old\n+new\n```\n"
+      T.isInfixOf "```" (stripMarkdownFences input) @?= False
+
+  -- ── checkPathWhitelist: test/ directory ────────────────────────────────────
+  , testCase "checkPathWhitelist: allows test/ paths" $ do
+      let result = checkPathWhitelist "/repo" "test/Spec.hs"
+      result @?= Right ()
+
+  , testCase "checkPathWhitelist: allows src/ paths" $ do
+      let result = checkPathWhitelist "/repo" "src/DGM/Foo.hs"
+      result @?= Right ()
+
+  , testCase "checkPathWhitelist: rejects paths outside src/ and test/" $ do
+      case checkPathWhitelist "/repo" "app/Main.hs" of
+        Left _  -> return ()
+        Right _ -> assertFailure "Expected Left for app/ path"
   ]

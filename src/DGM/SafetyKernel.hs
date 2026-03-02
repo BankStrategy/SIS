@@ -30,6 +30,8 @@ module DGM.SafetyKernel
   , auditCommand
   , appendAudit
   , newAuditLog
+    -- * Path whitelisting (exposed for testing)
+  , checkPathWhitelist
   ) where
 
 import Control.Concurrent.STM
@@ -304,18 +306,22 @@ checkPathWhitelist repoRoot path
       Left "Path not whitelisted: stateRepoRoot is not configured"
   | otherwise =
       let srcDir    = normalise (repoRoot <> "/src/")
+          testDir   = normalise (repoRoot <> "/test/")
           absPath   = if isAbsolute path then path else repoRoot <> "/" <> path
           normPath  = normalise absPath
-          -- Check that normPath starts with srcDir.
-          -- splitPath srcDir gives path components including trailing slash on dirs.
+          -- Check that normPath starts with srcDir or testDir.
+          -- splitPath gives path components including trailing slash on dirs.
           srcParts  = splitPath srcDir
+          testParts = splitPath testDir
           pathParts = splitPath normPath
           underSrc  = length pathParts >= length srcParts
                       && take (length srcParts) pathParts == srcParts
-      in if underSrc
+          underTest = length pathParts >= length testParts
+                      && take (length testParts) pathParts == testParts
+      in if underSrc || underTest
            then Right ()
            else Left ("Path not whitelisted: " <> T.pack path
-                      <> " is outside repo src/ directory")
+                      <> " is outside repo src/ and test/ directories")
 
 -- | Write @content@ to @path@ atomically using a temp file + rename.
 --

@@ -41,6 +41,15 @@ module DGM.Oracle
   , oracleHealthCheck
     -- * .env parsing (exposed for testing)
   , parseDotEnv
+    -- * Diff parsing (exposed for testing / cross-file routing)
+  , parseDiffResponse
+  , parseDiffResponseWithPath
+  , extractDiffTargetPath
+    -- * Test helpers (exposed for testing)
+  , countTestCases
+  , validateMaintainTests
+  , isTestPath
+  , stripMarkdownFences
   ) where
 
 import Data.Text (Text)
@@ -48,6 +57,7 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import System.Environment (lookupEnv)
 import System.Directory (doesFileExist)
+import System.FilePath (splitDirectories, normalise)
 import Control.Exception (try, SomeException)
 import Data.Maybe (mapMaybe)
 
@@ -355,15 +365,24 @@ oracleSemanticSystemPrompt =
   "- TEST: Add test cases for untested functions (append to test/Spec.hs)\n" <>
   "- TYPE_SAFETY: More precise types, replace partial functions with total ones, " <>
   "add {-@ ... @-} LiquidHaskell refinement annotations\n\n" <>
+  "CRITICAL: Always include file path headers in your diff:\n" <>
+  "--- a/<target-file-path>\n" <>
+  "+++ b/<target-file-path>\n" <>
+  "For TEST mutations, the target is test/Spec.hs, NOT the module being analyzed.\n" <>
+  "For all other categories, the target is the module source file shown below.\n\n" <>
   "Choose the highest-impact category. Output ONLY the diff. No explanation, no fences."
 
 -- | Like 'proposeMutation' but takes a pre-built semantic prompt with deep
 -- structural analysis.  Used when no GHC warnings exist and the system falls
 -- through to the engineer-grade tier.
+--
+-- Returns @(Maybe FilePath, HsMutation)@ — the @Maybe FilePath@ is the
+-- target file extracted from diff headers (e.g. @test/Spec.hs@ for TEST
+-- mutations).  When @Nothing@, the caller should use the analyzed source file.
 proposeMutationSemantic
   :: OracleEnv
   -> FilePath -> Text -> Text   -- ^ file path, source, semantic prompt
-  -> IO (Either Text HsMutation)
+  -> IO (Either Text (Maybe FilePath, HsMutation))
 proposeMutationSemantic env fp _src semanticPrompt = do
   let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
       bodyLBS = encode $ object
@@ -393,8 +412,8 @@ proposeMutationSemantic env fp _src semanticPrompt = do
         Right resp -> return $ case Aeson.decode (HTTP.getResponseBody resp) of
           Nothing                   -> Left "oracle-semantic: JSON decode failed"
           Just (OracleResponse txt) ->
-            case parseDiffResponse txt of
-              Right hm -> Right hm { hmDescription = "oracle-semantic: " <> hmDescription hm }
+            case parseDiffResponseWithPath txt of
+              Right (mPath, hm) -> Right (mPath, hm { hmDescription = "oracle-semantic: " <> hmDescription hm })
               Left err -> Left err
 
 -- | Propose a coordinated change set across multiple files.
@@ -464,7 +483,16 @@ splitOnFileHeaders = go Nothing []
     go (Just fp) acc [] = [(fp, reverse acc)]
     go mFp acc (l:ls)
       | "--- a/" `T.isPrefixOf` l =
-          let newFp = T.unpack (T.drop 6 (T.strip l))
+          let raw   = T.drop 6 (T.stripEnd l)
+              newFp = T.unpack raw
+              prev  = case mFp of
+                        Nothing -> []
+                        Just fp -> [(fp, reverse acc)]
+          in  prev ++ go (Just newFp) [l] ls
+      | "--- " `T.isPrefixOf` l, not ("/dev/null" `T.isInfixOf` l) =
+          -- Handle "--- src/Foo.hs" (no a/ prefix) as fallback
+          let raw   = T.drop 4 (T.stripEnd l)
+              newFp = T.unpack raw
               prev  = case mFp of
                         Nothing -> []
                         Just fp -> [(fp, reverse acc)]
@@ -550,7 +578,14 @@ parseDiffResponse content =
                }
   where
     applyAllHunks :: [DiffHunk] -> Text -> Either Text Text
-    applyAllHunks hs src = fmap T.unlines $ foldM applyOneHunk (T.lines src) hs
+    applyAllHunks hs src = do
+      resultLines <- foldM applyOneHunk (T.lines src) hs
+      let result = T.unlines resultLines
+      if T.null (T.strip result)
+        then Left "diff produced empty output"
+        else if result == src
+          then Left "diff produced no change"
+          else Right result
       where
         applyOneHunk acc h = applyHunk h acc
 
@@ -563,14 +598,18 @@ applyLineDiff removes adds src =
   in  fmap T.unlines $ applyHunk hunk (T.lines src)
 
 -- | Find the first index of @needle@ as a contiguous sublist of @haystack@.
--- Two-pass strategy: first tries trailing-whitespace-normalized match, then
--- falls back to a loose match that strips all leading/trailing whitespace
--- (handles LLM diffs with slightly different indentation).
+-- Three-pass strategy:
+--   1. Trailing-whitespace-normalized match (exact indentation).
+--   2. Loose match (strip all leading/trailing whitespace).
+--   3. Whitespace-collapsing match (collapse internal whitespace to single spaces).
+-- Only used for index matching — splice uses original source lines.
 findSubseq :: [Text] -> [Text] -> Maybe Int
 findSubseq needle haystack =
   case findSubseqExact needle haystack of
     Just idx -> Just idx
-    Nothing  -> findSubseqLoose needle haystack
+    Nothing  -> case findSubseqLoose needle haystack of
+      Just idx -> Just idx
+      Nothing  -> findSubseqWsCollapse needle haystack
   where
     findSubseqExact ns hs = go 0 hs
       where
@@ -590,19 +629,32 @@ findSubseq needle haystack =
         go i xs
           | map normL (take n' xs) == nsNorm = Just i
           | otherwise = go (i + 1) (tail xs)
+    findSubseqWsCollapse ns hs = go 0 hs
+      where
+        n' = length ns
+        normalizeWs = T.unwords . T.words
+        nsNorm = map normalizeWs ns
+        go _ [] = Nothing
+        go i xs
+          | map normalizeWs (take n' xs) == nsNorm = Just i
+          | otherwise = go (i + 1) (tail xs)
 
 -- | Strip markdown fences (@```diff@, @```haskell@, @```@ etc.) from LLM output.
+-- Handles leading/trailing blank lines and one preamble line before fence
+-- (e.g. "Here is the diff:").
 stripMarkdownFences :: Text -> Text
 stripMarkdownFences t =
-  let ls = T.lines t
-      -- Drop leading fence line if present
+  let ls = dropWhile (T.null . T.strip) (T.lines t)
+      isFence l = "```" `T.isPrefixOf` T.strip l
+      -- Drop leading fence line if present, or preamble + fence
       ls1 = case ls of
-              (h:rest) | "```" `T.isPrefixOf` T.strip h -> rest
+              (h:rest) | isFence h -> rest
+              (_preamble:h:rest) | isFence h -> rest  -- one preamble line before fence
               _ -> ls
-      -- Drop trailing fence line if present
-      ls2 = case reverse ls1 of
-              (h:rest) | "```" `T.isPrefixOf` T.strip h -> reverse rest
-              _ -> ls1
+      -- Drop trailing blank lines, then trailing fence
+      ls2 = case dropWhile (T.null . T.strip) (reverse ls1) of
+              (h:rest) | isFence h -> reverse rest
+              other -> reverse other
   in T.unlines ls2
 
 #else
@@ -641,7 +693,7 @@ proposeMutationEnriched _env _fp _src _prompt =
 proposeMutationSemantic
   :: OracleEnv
   -> FilePath -> Text -> Text
-  -> IO (Either Text HsMutation)
+  -> IO (Either Text (Maybe FilePath, HsMutation))
 proposeMutationSemantic _env _fp _src _prompt =
   return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
 
@@ -670,4 +722,89 @@ scoreAndRankMutations _env muts = return [(m, 0.5) | m <- muts]
 oracleHealthCheck :: OracleEnv -> IO Bool
 oracleHealthCheck _env = return False
 
+-- In the stub branch, stripMarkdownFences and parseDiffResponse are needed
+-- by the pure helpers below.
+stripMarkdownFences :: Text -> Text
+stripMarkdownFences t =
+  let ls = dropWhile (T.null . T.strip) (T.lines t)
+      isFence l = "```" `T.isPrefixOf` T.strip l
+      ls1 = case ls of
+              (h:rest) | isFence h -> rest
+              (_preamble:h:rest) | isFence h -> rest
+              _ -> ls
+      ls2 = case dropWhile (T.null . T.strip) (reverse ls1) of
+              (h:rest) | isFence h -> reverse rest
+              other -> reverse other
+  in T.unlines ls2
+
+parseDiffResponse :: Text -> Either Text HsMutation
+parseDiffResponse _content = Left "DGM.Oracle: build with -f+with-oracle for diff parsing"
+
 #endif
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Cross-file routing helpers (always available, no CPP guard)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Like 'parseDiffResponse' but also extracts the target file path from
+-- diff headers (@--- a/<path>@ or @+++ b/<path>@).
+--
+-- Returns @(Just path, mutation)@ when a file header is found,
+-- @(Nothing, mutation)@ otherwise (caller should use the analyzed source file).
+parseDiffResponseWithPath :: Text -> Either Text (Maybe FilePath, HsMutation)
+parseDiffResponseWithPath content =
+  let stripped = stripMarkdownFences content
+      ls      = T.lines stripped
+      mPath   = extractDiffTargetPath ls
+  in case parseDiffResponse content of
+       Right hm -> Right (mPath, hm)
+       Left err -> Left err
+
+-- | Extract the target file path from unified diff header lines.
+--
+-- Scans for @+++ b/<path>@ first (preferred), then falls back to
+-- @--- a/<path>@.  Skips @/dev/null@ paths.
+extractDiffTargetPath :: [Text] -> Maybe FilePath
+extractDiffTargetPath ls =
+  -- Prefer +++ b/ (the "to" file)
+  case mapMaybe extractPlusPath ls of
+    (p:_) -> Just p
+    []    -> case mapMaybe extractMinusPath ls of
+               (p:_) -> Just p
+               []    -> Nothing
+  where
+    extractPlusPath l
+      | "+++ b/" `T.isPrefixOf` l =
+          let raw = T.unpack (T.stripEnd (T.drop 6 l))
+          in if raw == "/dev/null" then Nothing else Just raw
+      | otherwise = Nothing
+    extractMinusPath l
+      | "--- a/" `T.isPrefixOf` l =
+          let raw = T.unpack (T.stripEnd (T.drop 6 l))
+          in if raw == "/dev/null" then Nothing else Just raw
+      | otherwise = Nothing
+
+-- | True when @fp@ contains a @\"test\"@ path component.
+isTestPath :: FilePath -> Bool
+isTestPath fp = "test" `elem` splitDirectories (normalise fp)
+
+-- | Count test cases in source text by counting occurrences of
+-- @testCase@, @testProperty@, and @testGroup@ calls.
+countTestCases :: Text -> Int
+countTestCases src =
+  let ls = T.lines src
+      isTestLine l = any (`T.isInfixOf` l) ["testCase ", "testProperty ", "testGroup "]
+  in length (filter isTestLine ls)
+
+-- | Validate that a test mutation does not decrease the number of test cases
+-- (monotonic specification growth).
+--
+-- Returns @Left err@ if the new content has fewer test cases than the original.
+validateMaintainTests :: Text -> Text -> Either Text ()
+validateMaintainTests original mutated =
+  let origCount = countTestCases original
+      mutCount  = countTestCases mutated
+  in if mutCount < origCount
+       then Left ("Test mutation rejected: test count decreased from "
+                 <> T.pack (show origCount) <> " to " <> T.pack (show mutCount))
+       else Right ()

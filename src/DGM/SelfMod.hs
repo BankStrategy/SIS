@@ -55,7 +55,7 @@ import DGM.HsAST
 import DGM.SafetyKernel
 import DGM.ModGraph (ModuleGraph(..), moduleImpact)
 import qualified Data.Map.Strict as Map
-import DGM.Oracle (newOracleEnv, MutationContext)
+import DGM.Oracle (newOracleEnv, MutationContext, isTestPath)
 import DGM.OracleHandle (withOracle, proposeMutationH, proposeMutationEnrichedH, proposeMutationSemanticH)
 import DGM.OracleContext (GhcWarning, buildModuleContext, buildEnrichedPrompt, buildSemanticPrompt)
 import DGM.SemanticContext (buildSemanticContext)
@@ -176,8 +176,9 @@ proposeSelfMutations st fps mCtx modGraph warnings = do
                         unless ("build with -f+with-oracle" `T.isInfixOf` err) $
                           hPutStrLn stderr ("DGM.SelfMod: oracle-semantic error for " ++ fp ++ ": " ++ T.unpack err)
                         return []
-                      Right om ->
-                        return (filter notBlacklisted [(fp, om, m)])
+                      Right (mTargetPath, om) ->
+                        let targetFp = maybe fp id mTargetPath
+                        in return (filter notBlacklisted [(targetFp, om, m)])
                   -- No functions found: fall back to standard prompt (tier 3).
                   Nothing -> do
                     let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
@@ -317,9 +318,9 @@ writeMutation
   -> HsModule      -- ^ The mutated module to write.
   -> IO (Either Text ())
 writeMutation st audit proof fp m = do
-  -- Layer 1: local DGM path check.
-  if not (isDGMPath fp)
-    then return (Left ("writeMutation: path must be under src/DGM/: " <> T.pack fp))
+  -- Layer 1: local DGM or test path check.
+  if not (isDGMPath fp) && not (isTestPath fp)
+    then return (Left ("writeMutation: path must be under src/DGM/ or test/: " <> T.pack fp))
     else do
       let content = printHsModule m
           cmd     = SystemWrite fp content proof

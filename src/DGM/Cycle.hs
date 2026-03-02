@@ -52,6 +52,8 @@ import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString.Base16 as B16
 
+import System.Directory (doesFileExist)
+
 import DGM.Types
 import DGM.AST
 import DGM.AbsoluteZero
@@ -72,7 +74,7 @@ import DGM.SelfCompile
 import DGM.ModGraph (ModuleGraph(..), buildModuleGraph, removesExportedName)
 import DGM.Rewriting (DynamicRule(..), applyDynamicRules)
 import DGM.HintBridge (HintEnv, newHintEnv, evalRuleCandidate)
-import DGM.Oracle (newOracleEnv, MutationContext(..))
+import DGM.Oracle (newOracleEnv, MutationContext(..), validateMaintainTests, isTestPath)
 import DGM.OracleContext (collectGhcWarnings, buildSemanticPrompt)
 import DGM.OracleHandle (withOracle, proposeChangeSetH)
 import DGM.SemanticContext (FunctionInfo(..), extractFunctions, buildSemanticContext)
@@ -437,23 +439,99 @@ tryCandidate cfg st step1 step2 oracleModel _srcs _ attempt | attempt >= 3 = do
   emit cfg stepEnd
   pure [step1, step2, stepEnd]
 tryCandidate cfg st step1 step2 oracleModel srcs ((fp, mut, origModule) : rest) attempt =
-  case applyHsMutation mut origModule of
-    Left applyErr -> do
+  case lookup fp srcs of
+    Just _ ->
+      -- Normal path: fp was pre-read, origModule content matches
+      case applyHsMutation mut origModule of
+        Left applyErr -> do
+          let step3 = StepResult StepClassify False
+                        ("Mutation inapplicable (attempt " <> T.pack (show (attempt + 1))
+                        <> "): " <> applyErr)
+          emit cfg step3
+          archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+            (Just ("Mutation inapplicable: " <> applyErr))
+          -- Blacklist inapplicable mutation so it is not re-proposed.
+          atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+            (Set.insert (fp, hmDescription mut))
+          flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
+          -- Try next candidate.
+          tryCandidate cfg st step1 step2 oracleModel srcs rest (attempt + 1)
+
+        Right mutModule ->
+          runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut origModule mutModule
+
+    Nothing ->
+      -- Cross-file: Oracle targeted a different file (e.g. test/Spec.hs)
+      handleCrossFileMutation cfg st step1 step2 oracleModel srcs fp mut rest attempt
+
+-- | Handle a cross-file mutation where the Oracle targeted a different file
+-- than the one being analyzed (e.g. proposing test changes to @test/Spec.hs@
+-- while analyzing @src/DGM/Foo.hs@).
+--
+-- 1. Verify the target file exists.
+-- 2. Read its current content.
+-- 3. Apply the mutation transform to the actual target content.
+-- 4. For test files: validate test count doesn't decrease (monotonic growth).
+-- 5. Proceed to the normal mutation pipeline.
+handleCrossFileMutation
+  :: CycleConfig
+  -> AgentState
+  -> StepResult        -- ^ step1 (propose)
+  -> StepResult        -- ^ step2 (hypothesise)
+  -> Maybe Text        -- ^ oracleModel tag
+  -> [(FilePath, Text)] -- ^ pre-read source contents
+  -> FilePath          -- ^ target file path (cross-file)
+  -> HsMutation        -- ^ the proposed mutation
+  -> [(FilePath, HsMutation, HsModule)]  -- ^ remaining candidates
+  -> Int               -- ^ attempt counter
+  -> IO [StepResult]
+handleCrossFileMutation cfg st step1 step2 oracleModel srcs fp mut rest attempt = do
+  exists <- doesFileExist fp
+  if not exists
+    then do
       let step3 = StepResult StepClassify False
-                    ("Mutation inapplicable (attempt " <> T.pack (show (attempt + 1))
-                    <> "): " <> applyErr)
+                    ("Cross-file target does not exist: " <> T.pack fp)
       emit cfg step3
       archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
-        (Just ("Mutation inapplicable: " <> applyErr))
-      -- Blacklist inapplicable mutation so it is not re-proposed.
-      atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
-        (Set.insert (fp, hmDescription mut))
-      flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
-      -- Try next candidate.
+        (Just ("Cross-file target does not exist: " <> T.pack fp))
       tryCandidate cfg st step1 step2 oracleModel srcs rest (attempt + 1)
-
-    Right mutModule ->
-      runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut origModule mutModule
+    else do
+      targetContent <- TIO.readFile fp
+      let targetModule = mkTextModule targetContent
+      -- Apply the mutation transform to the actual target content
+      case applyHsMutation mut targetModule of
+        Left applyErr -> do
+          let step3 = StepResult StepClassify False
+                        ("Cross-file mutation inapplicable (attempt "
+                        <> T.pack (show (attempt + 1)) <> "): " <> applyErr)
+          emit cfg step3
+          archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+            (Just ("Cross-file mutation inapplicable: " <> applyErr))
+          atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+            (Set.insert (fp, hmDescription mut))
+          flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
+          tryCandidate cfg st step1 step2 oracleModel srcs rest (attempt + 1)
+        Right mutModule -> do
+          -- For test files: validate monotonic test growth
+          if isTestPath fp
+            then case validateMaintainTests targetContent (printHsModule mutModule) of
+              Left valErr -> do
+                let step3 = StepResult StepClassify False
+                              ("Test validation failed: " <> valErr)
+                emit cfg step3
+                archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+                  (Just valErr)
+                atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
+                  (Set.insert (fp, hmDescription mut))
+                flushBlacklist (ccArchiveHandle cfg) [(fp, hmDescription mut)]
+                tryCandidate cfg st step1 step2 oracleModel srcs rest (attempt + 1)
+              Right () ->
+                -- Add target to srcs so runMutationPipeline can find the original
+                let srcs' = (fp, targetContent) : srcs
+                in runMutationPipeline cfg st step1 step2 oracleModel srcs' fp mut targetModule mutModule
+            else do
+              let srcs' = (fp, targetContent) : srcs
+              runMutationPipeline cfg st step1 step2 oracleModel srcs' fp mut targetModule mutModule
 
 -- | Execute the write\/LH\/SBV\/test\/commit pipeline for a successfully applied
 -- mutation candidate.  Extracted from 'runSelfModCycle' to support

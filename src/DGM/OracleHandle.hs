@@ -43,6 +43,7 @@ import Data.Text (Text)
 import DGM.HsAST (HsMutation)
 import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, proposeMutationEnriched, proposeMutationSemantic, proposeChangeSet, scoreAndRankMutations)
 
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Capability token
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -117,10 +118,14 @@ proposeMutationEnrichedH (OracleHandle_ env) = proposeMutationEnriched env
 -- Like 'proposeMutationH' but takes a pre-built semantic prompt that
 -- includes type signatures, complexity metrics, test coverage, and
 -- failure history.
+--
+-- Returns @(Maybe FilePath, HsMutation)@ — the @Maybe FilePath@ is the
+-- target file extracted from diff headers (e.g. @test/Spec.hs@ for TEST
+-- mutations).
 proposeMutationSemanticH
   :: OracleHandle
   -> FilePath -> Text -> Text   -- ^ file path, source, semantic prompt
-  -> IO (Either Text HsMutation)
+  -> IO (Either Text (Maybe FilePath, HsMutation))
 proposeMutationSemanticH (OracleHandle_ env) = proposeMutationSemantic env
 
 -- | Propose a coordinated change set across multiple related files.
