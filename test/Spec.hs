@@ -59,6 +59,7 @@ tests = testGroup "DGM"
   , natLangTests
   , oracleContextTests
   , semanticContextTests
+  , groupRelatedModulesTests
   , semanticPromptTests
   , parseTestDetailTests
   , enrichScoreV2Tests
@@ -2641,4 +2642,51 @@ failureReasonTests = testGroup "DGM.Types.entryFailureReason"
         [ mkEntry "e1" 1.0 True ]
       result <- atomically $ getRecentFailures failures "src/DGM/Foo.hs"
       null result @?= True
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- groupRelatedModules tests (Stage 5)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+groupRelatedModulesTests :: TestTree
+groupRelatedModulesTests = testGroup "DGM.SelfMod.groupRelatedModules"
+  [ testCase "groupRelatedModules: groups mutual imports" $ do
+      -- A imports B, B imports A → they should be in the same group.
+      let mg = ModuleGraph
+            { mgModules = Map.fromList [("A", "a.hs"), ("B", "b.hs"), ("C", "c.hs")]
+            , mgImports = Map.fromList [("A", ["B"]), ("B", ["A"]), ("C", [])]
+            , mgExports = Map.empty
+            , mgUsedBy  = Map.fromList [("A", ["B"]), ("B", ["A"])]
+            }
+          groups = groupRelatedModules mg ["a.hs", "b.hs", "c.hs"]
+      -- a.hs and b.hs should be grouped together
+      let abGroup = filter (\g -> "a.hs" `elem` g && "b.hs" `elem` g) groups
+      length abGroup >= 1 @?= True
+
+  , testCase "groupRelatedModules: singletons for unrelated files" $ do
+      let mg = ModuleGraph
+            { mgModules = Map.fromList [("X", "x.hs"), ("Y", "y.hs")]
+            , mgImports = Map.fromList [("X", []), ("Y", [])]
+            , mgExports = Map.empty
+            , mgUsedBy  = Map.empty
+            }
+          groups = groupRelatedModules mg ["x.hs", "y.hs"]
+      -- Each file should be in its own singleton group
+      all (\g -> length g <= 1) groups @?= True
+
+  , testCase "groupRelatedModules: caps groups at 3" $ do
+      -- A imports B, B imports C, C imports D → transitive, but capped at 3
+      let mg = ModuleGraph
+            { mgModules = Map.fromList [("A", "a.hs"), ("B", "b.hs"), ("C", "c.hs"), ("D", "d.hs")]
+            , mgImports = Map.fromList [("A", ["B", "C", "D"]), ("B", []), ("C", []), ("D", [])]
+            , mgExports = Map.empty
+            , mgUsedBy  = Map.fromList [("B", ["A"]), ("C", ["A"]), ("D", ["A"])]
+            }
+          groups = groupRelatedModules mg ["a.hs", "b.hs", "c.hs", "d.hs"]
+      -- No group should exceed 3 members
+      all (\g -> length g <= 3) groups @?= True
+
+  , testCase "groupRelatedModules: empty file list returns empty" $ do
+      let mg = emptyModuleGraph
+      groupRelatedModules mg [] @?= []
   ]

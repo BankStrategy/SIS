@@ -36,6 +36,7 @@ import qualified Control.Exception as Control.Exception
 import Control.Exception (SomeException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -61,18 +62,21 @@ import DGM.Archive (addEntry, computeStats, ArchiveStats(..), ArchiveHandle, flu
 import DGM.SafetyKernel
 import qualified DGM.Archive as Archive
 
-import DGM.HsAST (HsMutation(..), HsModule, applyHsMutation, printHsModule)
-import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation)
+import DGM.HsAST (HsMutation(..), HsModule, applyHsMutation, printHsModule, mkTextModule)
+import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation, groupRelatedModules)
 import DGM.Liquid (verifyWithLiquid, LiquidResult(..))
 import DGM.SelfCompile
-  ( CompileResult(..), testSelf, scoreCompileResult, enrichScore, buildPreflight
+  ( CompileResult(..), testSelf, scoreCompileResult, enrichScore, enrichScoreV2, buildPreflight
   , SelfModTxn(..), withSelfModTxn
   )
-import DGM.ModGraph (buildModuleGraph, removesExportedName)
+import DGM.ModGraph (ModuleGraph(..), buildModuleGraph, removesExportedName)
 import DGM.Rewriting (DynamicRule(..), applyDynamicRules)
 import DGM.HintBridge (HintEnv, newHintEnv, evalRuleCandidate)
 import DGM.Oracle (newOracleEnv, MutationContext(..))
-import DGM.OracleContext (collectGhcWarnings)
+import DGM.OracleContext (collectGhcWarnings, buildSemanticPrompt)
+import DGM.OracleHandle (withOracle, proposeChangeSetH)
+import DGM.SemanticContext (FunctionInfo(..), extractFunctions, buildSemanticContext)
+import DGM.Archive (getRecentFailures)
 import DGM.RuleMiner (minePatterns, boostByFile, evictStaleRules)
 import DGM.NatLang (EvolutionGoal, applyGoal, describeGoal)
 
@@ -339,7 +343,77 @@ runSelfModCycle cfg = do
       emit cfg stepEnd
       pure [step1, step2, stepEnd]
 
-    _ -> tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+    ((topFp, _, _) : _) -> do
+      -- ── Multi-file activation check ──────────────────────────────────
+      -- Try a coordinated multi-file change set when:
+      --   (a) the top candidate's file has 3+ blacklist entries, OR
+      --   (b) the file has high cross-module coupling (>2 dependents)
+      blacklist <- atomically $ readTVar (stateMutationBlacklist st)
+      let blCount = length [ () | (f, _) <- Set.toList blacklist, f == topFp ]
+          usedByCount = case [ deps | (_, deps) <- Map.toList (mgUsedBy modGraph)
+                                    , topFp `elem` map (\nm -> fromMaybe "" (Map.lookup nm (mgModules modGraph))) deps
+                             ] of
+                          (d:_) -> length d
+                          []    -> 0
+          shouldMultiFile = blCount >= 3 || usedByCount > 2
+      if shouldMultiFile
+        then do
+          mOracleEnv <- newOracleEnv
+          case mOracleEnv of
+            Nothing ->
+              -- No oracle available; fall through to single-file.
+              tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+            Just oEnv -> do
+              -- Group related modules and build combined semantic prompt.
+              let groups = groupRelatedModules modGraph fps
+                  topGroup = case filter (topFp `elem`) groups of
+                               (g:_) -> g
+                               []    -> [topFp]
+              -- Build combined semantic context for each file in the group.
+              combinedPrompts <- mapM (\gfp -> do
+                let gSrc = fromMaybe "" (lookup gfp preReadSources)
+                recentFails <- atomically $ getRecentFailures (stateArchive st) gfp
+                sc <- buildSemanticContext modGraph recentFails gfp gSrc
+                return (buildSemanticPrompt sc mCtx)) topGroup
+              let validPrompts = [ p | Just p <- combinedPrompts ]
+              if null validPrompts
+                then tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+                else do
+                  let combined = T.intercalate "\n\n---\n\n" validPrompts
+                  eResult <- withOracle oEnv $ \h -> proposeChangeSetH h combined
+                  case eResult of
+                    Left _err ->
+                      tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+                    Right fileMuts -> do
+                      -- Apply each file's mutation, build (fp, mut, module) triples.
+                      applied <- mapM (\(mfp, hm) -> do
+                        let realFp = if null mfp then topFp else mfp
+                            mSrc = lookup realFp preReadSources
+                        case mSrc of
+                          Nothing -> return Nothing
+                          Just src -> case applyHsMutation hm (mkTextModule src) of
+                            Left _    -> return Nothing
+                            Right m'  -> return (Just (realFp, hm, m'))
+                        ) fileMuts
+                      let validChanges = [x | Just x <- applied]
+                      if null validChanges
+                        then tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+                        else do
+                          csResult <- runChangeSetPipeline cfg validChanges
+                          case csResult of
+                            Right gitHash -> do
+                              let csStep = StepResult StepPersist True
+                                             ("ChangeSet committed " <> T.take 8 gitHash
+                                             <> " (" <> T.pack (show (length validChanges)) <> " files)")
+                              emit cfg csStep
+                              pure [step1, step2, csStep]
+                            Left csErr -> do
+                              let csStep = StepResult StepPersist False
+                                             ("ChangeSet failed: " <> T.take 60 csErr <> " — falling back to single-file")
+                              emit cfg csStep
+                              tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
+        else
+          tryCandidate cfg st step1 step2 oracleModel preReadSources ranked 0
 
 -- | Try up to 3 mutation candidates in sequence.  On apply failure, blacklist
 -- and advance to the next candidate.  On success, delegate to
@@ -420,9 +494,19 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
       proof  = mockQuorumProof opName now
 
   -- IORefs capture intermediate results for step messages + archive.
-  scoreRef <- newIORef (0.0 :: Double)
-  lhRef    <- newIORef (Nothing :: Maybe Text)
-  sbvRef   <- newIORef (Nothing :: Maybe Text)
+  scoreRef      <- newIORef (0.0 :: Double)
+  lhRef         <- newIORef (Nothing :: Maybe Text)
+  sbvRef        <- newIORef (Nothing :: Maybe Text)
+  failedTestRef <- newIORef ([] :: [Text])
+
+  -- Compute complexity delta for enrichScoreV2.
+  let origFuncs    = extractFunctions origText
+      mutFuncs     = extractFunctions (printHsModule mutModule)
+      origMaxC     = if null origFuncs then 1 else maximum (map fiComplexity origFuncs)
+      mutMaxC      = if null mutFuncs  then 1 else maximum (map fiComplexity mutFuncs)
+      complexDelta = Just (mutMaxC - origMaxC)  -- negative = improvement
+      -- Novelty: check if this mutation description prefix is new for this file.
+      isNovel      = True  -- conservative: treat all oracle mutations as novel
 
   txnResult <- withSelfModTxn txn $ do
     wr <- writeMutation st (ccAuditLog cfg) proof fp mutModule
@@ -455,11 +539,21 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
                 writeIORef sbvRef (Just "skipped (source-level)")
                 cr <- testSelf
                 let base = scoreCompileResult cr
-                    sc   = enrichScore base origLen mutLen (Just lhText)
+                    sc   = enrichScoreV2 base origLen mutLen (Just lhText)
+                             complexDelta isNovel
                 writeIORef scoreRef sc
+                -- Capture individual failed test names for the error feedback loop.
+                case cr of
+                  CompileSuccess _ _ _ fts -> writeIORef failedTestRef fts
+                  _                        -> return ()
                 if sc >= 1.0
                   then return (Right ())
-                  else return (Left ("Tests degraded, score=" <> T.pack (show sc)))
+                  else do
+                    failedNames <- readIORef failedTestRef
+                    let failMsg = if null failedNames
+                          then "Tests degraded, score=" <> T.pack (show sc)
+                          else "Tests failed: " <> T.intercalate ", " failedNames
+                    return (Left failMsg)
 
   score   <- readIORef scoreRef
   mLhText <- readIORef lhRef
