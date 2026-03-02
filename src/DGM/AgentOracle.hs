@@ -261,12 +261,22 @@ agentSystemPrompt = T.unlines
   , "- Match existing code style exactly (indentation, naming conventions)"
   , "- For test changes, target test/Spec.hs"
   , ""
+  , "BUILD ENVIRONMENT:"
+  , "- The build runs with DEFAULT flags only: with-sqlite (on), everything else OFF"
+  , "- Specifically: WITH_HINT, WITH_EXACTPRINT, WITH_SBV, WITH_LIQUID are NOT enabled"
+  , "- Code guarded by #ifdef WITH_HINT etc is NOT compiled — do NOT add to those sections"
+  , "- Many modules have #ifdef stubs at the bottom — work with the STUBS, not the real impl"
+  , "- The test suite also builds with default flags — only ~166 default tests run"
+  , "- WITH_ORACLE IS enabled (your own code runs under it)"
+  , ""
   , "GUIDELINES:"
   , "- Break large changes into small, testable increments"
   , "- Each submit_change should leave the codebase in a working state"
-  , "- If a submit fails, read the error, fix your diff, and try again"
+  , "- If a submit fails, READ THE ERROR carefully — it often has the GHC error message"
+  , "- Common failure: adding exports for functions that only exist under #ifdef guards"
   , "- You can modify multiple files across multiple submit_change calls"
   , "- Re-read files after changes to see the updated state"
+  , "- Use try_change first to validate before submit_change"
   , "- Do not stop until the task is fully implemented and all tests pass"
   ]
 
@@ -407,6 +417,13 @@ executeToolCalls targetFp diffParser tcs ls0 = go tcs ls0 []
       hPutStrLn stderr $ "[agent] tool_call: " ++ T.unpack name
       (result, st') <- dispatch name args st
       hPutStrLn stderr $ "[agent] tool result: " ++ show (T.length result) ++ " chars"
+      -- Log full details for change tools to debug file
+      case name of
+        "submit_change" -> appendFile "dgm-agent-debug.log"
+          ("[submit_change] args=" ++ T.unpack (T.take 500 args) ++ "\nresult=" ++ T.unpack (T.take 500 result) ++ "\n---\n")
+        "try_change" -> appendFile "dgm-agent-debug.log"
+          ("[try_change] args=" ++ T.unpack (T.take 500 args) ++ "\nresult=" ++ T.unpack (T.take 500 result) ++ "\n---\n")
+        _ -> return ()
       let toolMsg = Aeson.object
             [ "role"         .= ("tool" :: Text)
             , "tool_call_id" .= tcId tc
@@ -582,7 +599,7 @@ toolRunBuild = do
   result <- buildPreflight
   case result of
     Right () -> return "Build succeeded."
-    Left err -> return $ "Build FAILED:\n" <> err
+    Left err -> return $ "Build FAILED:\n" <> T.take 1000 err
 
 toolRunTests :: IO Text
 toolRunTests = do
@@ -595,9 +612,14 @@ toolTryChange defaultFp diffParser argsJson = do
   let args     = parseToolArgs argsJson
       diffText = argText args "diff"
   if T.null diffText
-    then return "Error: 'diff' argument is required"
+    then do
+      hPutStrLn stderr $ "[agent] try_change: empty diff arg, raw args: " ++ T.unpack (T.take 200 argsJson)
+      return "Error: 'diff' argument is required"
     else case diffParser diffText of
-      Left err -> return $ "Error parsing diff: " <> err
+      Left err ->
+        return $ "Error parsing diff: " <> err
+          <> "\n\nYour diff must use unified diff format with @@ hunk headers. Example:\n"
+          <> "--- a/src/DGM/Foo.hs\n+++ b/src/DGM/Foo.hs\n@@ -10,3 +10,4 @@\n context line\n-old line\n+new line\n+added line"
       Right (mPath, hm) -> do
         let fp = maybe defaultFp id mPath
         exists <- doesFileExist fp
@@ -606,7 +628,9 @@ toolTryChange defaultFp diffParser argsJson = do
           else do
             original <- TIO.readFile fp
             case hmTransform hm original of
-              Left err -> return $ "Error applying diff: " <> err
+              Left err -> do
+                hPutStrLn stderr $ "[agent] try_change transform error: " ++ T.unpack err
+                return $ "Error applying diff: " <> err
               Right mutated -> do
                 result <- (do
                   TIO.writeFile fp mutated
@@ -628,9 +652,15 @@ toolSubmitChange defaultFp diffParser argsJson = do
   let args     = parseToolArgs argsJson
       diffText = argText args "diff"
   if T.null diffText
-    then return ("Error: 'diff' argument is required", Nothing)
+    then do
+      hPutStrLn stderr $ "[agent] submit_change: empty diff arg, raw args: " ++ T.unpack (T.take 200 argsJson)
+      return ("Error: 'diff' argument is required", Nothing)
     else case diffParser diffText of
-      Left err -> return ("Error parsing diff: " <> err, Nothing)
+      Left err ->
+        return ("Error parsing diff: " <> err
+          <> "\n\nYour diff must use unified diff format with @@ hunk headers. Example:\n"
+          <> "--- a/src/DGM/Foo.hs\n+++ b/src/DGM/Foo.hs\n@@ -10,3 +10,4 @@\n context line\n-old line\n+new line\n+added line"
+          , Nothing)
       Right (mPath, hm) -> do
         let fp = maybe defaultFp id mPath
         exists <- doesFileExist fp
@@ -639,7 +669,9 @@ toolSubmitChange defaultFp diffParser argsJson = do
           else do
             original <- TIO.readFile fp
             case hmTransform hm original of
-              Left err -> return ("Error applying diff: " <> err, Just fp)
+              Left err -> do
+                hPutStrLn stderr $ "[agent] submit_change transform error on " ++ fp ++ ": " ++ T.unpack err
+                return ("Error applying diff: " <> err, Just fp)
               Right mutated -> do
                 -- Apply the change
                 TIO.writeFile fp mutated
@@ -648,7 +680,7 @@ toolSubmitChange defaultFp diffParser argsJson = do
                 case buildResult of
                   Left buildErr -> do
                     TIO.writeFile fp original  -- revert on build failure
-                    return ("SUBMIT FAILED (build):\n" <> buildErr, Just fp)
+                    return ("SUBMIT FAILED (build):\n" <> T.take 1000 buildErr, Just fp)
                   Right () -> do
                     -- Test
                     testResult <- testSelf
@@ -672,7 +704,7 @@ toolSubmitChange defaultFp diffParser argsJson = do
                       CompileFailure errs phase -> do
                         TIO.writeFile fp original  -- revert on failure
                         return ( "SUBMIT FAILED (" <> T.pack (show phase) <> "):\n"
-                               <> T.take 500 errs
+                               <> T.take 1500 errs
                                , Just fp)
 
 -- ─────────────────────────────────────────────────────────────────────────────

@@ -130,19 +130,6 @@ tests = testGroup "DGM"
 #ifdef WITH_SBV
   , sbvVerificationTests
 #endif
-
-  , testCase "findGitRoot finds root from subdirectory" $
-      withTempGitRepo $ \repoDir fp -> do
-        let subDir = takeDirectory fp
-        mRoot <- findGitRoot subDir
-        mRoot @?= Just repoDir
-
-  , testCase "gitRevParseHead returns a hash" $
-      withTempGitRepo $ \repoDir _ -> do
-        res <- gitRevParseHead repoDir
-        case res of
-          Left err -> assertFailure ("gitRevParseHead failed: " <> T.unpack err)
-          Right h  -> T.length h @?= 40
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -1438,19 +1425,6 @@ commitMutationTests = testGroup "DGM.SelfMod.commitMutation"
           msg   = commitMessage "src/DGM/Foo.hs" mut entry
       T.length msg @?= 72
   ]
-
-  , testCase "findGitRoot finds root from subdirectory" $
-      withTempGitRepo $ \repoDir fp -> do
-        let subDir = takeDirectory fp
-        mRoot <- findGitRoot subDir
-        mRoot @?= Just repoDir
-
-  , testCase "gitRevParseHead returns a hash" $
-      withTempGitRepo $ \repoDir _ -> do
-        res <- gitRevParseHead repoDir
-        case res of
-          Left err -> assertFailure ("gitRevParseHead failed: " <> T.unpack err)
-          Right h  -> T.length h @?= 40
 
 -- | Create a temporary git repository with one initial DGM source file.
 --

@@ -91,8 +91,19 @@ buildPreflight = do
   case result of
     CompileSuccess {} -> return (Right ())
     CompileFailure errs phase ->
-      return (Left ("Build pre-flight failed (" <> T.pack (show phase) <> "): "
-                    <> T.take 200 errs))
+      -- Strip cabal boilerplate to surface actual GHC errors.
+      let useful = extractGhcErrors errs
+      in return (Left ("Build pre-flight failed (" <> T.pack (show phase) <> "): "
+                    <> T.take 1000 useful))
+
+-- | Strip cabal's preamble output to surface actual GHC error messages.
+extractGhcErrors :: Text -> Text
+extractGhcErrors txt =
+  let ls = T.lines txt
+      -- Drop lines until we find actual error/warning indicators
+      isGhcLine l = any (`T.isInfixOf` l) ["error:", "warning:", "Error:", "Not in scope", "Variable not in scope"]
+      ghcLines = dropWhile (not . isGhcLine) ls
+  in if null ghcLines then txt else T.unlines (take 30 ghcLines)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Scoring
