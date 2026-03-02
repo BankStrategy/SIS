@@ -37,6 +37,8 @@ module DGM.Types
   , AgentState(..)
   , newAgentState
   , newAgentStateWithRoot
+    -- * Multi-file change sets
+  , ChangeSet(..)
     -- * Phase G: module safety
   , ModuleName
   , safeguardedModules
@@ -161,6 +163,7 @@ data QuorumProof = QuorumProof
       , entryLiquidResult :: Maybe Text
       , entrySbvResult    :: Maybe Text
       , entryOracleModel  :: Maybe Text
+      , entryFailureReason :: Maybe Text
       }
   @-}
 data ArchiveEntry = ArchiveEntry
@@ -175,6 +178,7 @@ data ArchiveEntry = ArchiveEntry
   , entryLiquidResult :: Maybe Text     -- ^ LiquidHaskell result: "SAFE" | "UNSAFE: …" | Nothing.
   , entrySbvResult    :: Maybe Text     -- ^ SBV equivalence result: "QED" | "Falsifiable: …" | "Timeout" | Nothing.
   , entryOracleModel  :: Maybe Text     -- ^ Oracle model that proposed the mutation, or Nothing (heuristic).
+  , entryFailureReason :: Maybe Text    -- ^ First 500 chars of GHC error text or failed test names. Nothing on success.
   } deriving (Show, Eq)
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +331,7 @@ instance ToJSON ArchiveEntry where
     , "lhResult"    .= entryLiquidResult e
     , "sbvResult"   .= entrySbvResult e
     , "oracleModel" .= entryOracleModel e
+    , "failureReason" .= entryFailureReason e
     ]
 
 instance FromJSON ArchiveEntry where
@@ -343,6 +348,7 @@ instance FromJSON ArchiveEntry where
       <*> o .:? "lhResult"
       <*> o .:? "sbvResult"
       <*> o .:? "oracleModel"
+      <*> o .:? "failureReason"
 
 -- | Handles into the agent's transactional state.
 --
@@ -392,6 +398,21 @@ newAgentStateWithRoot bootstrapAST repoRoot = atomically $ do
     , stateSbvQueue          = sq
     , stateMutationBlacklist = bl
     }
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Multi-file change sets
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | A coordinated set of changes across multiple related modules.
+--
+-- When single-file mutations hit repeated failures (e.g. cross-module type
+-- changes), the system groups tightly-coupled modules and proposes a
+-- change set that modifies them atomically.
+data ChangeSet = ChangeSet
+  { csDescription :: !Text
+  , csDiffs       :: [(FilePath, Text)]
+    -- ^ Each pair is @(filePath, diffText)@ — the unified diff for that file.
+  } deriving (Show, Eq)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Phase G: module safety (SELFMOD.md §Phase G)

@@ -101,6 +101,7 @@ library
     , DGM.OracleContext
     , DGM.NatLang
     , DGM.RuleMiner
+    , DGM.SemanticContext
   hs-source-dirs:  src
   default-language: Haskell2010
   default-extensions:

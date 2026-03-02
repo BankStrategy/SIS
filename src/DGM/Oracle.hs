@@ -32,6 +32,8 @@ module DGM.Oracle
     -- * Proposal
   , proposeMutation
   , proposeMutationEnriched
+  , proposeMutationSemantic
+  , proposeChangeSet
   , MutationContext(..)
     -- * Scoring
   , scoreAndRankMutations
@@ -340,6 +342,135 @@ proposeMutationEnriched env fp _src enrichedPrompt = do
               Right hm -> Right hm { hmDescription = "oracle-enriched: " <> hmDescription hm }
               Left err -> Left err
 
+-- | System prompt for semantic (engineer-grade) mutation requests.
+oracleSemanticSystemPrompt :: Text
+oracleSemanticSystemPrompt =
+  "You are a senior Haskell engineer reviewing a module for improvement. You receive " <>
+  "deep structural analysis including type signatures, complexity metrics, test " <>
+  "coverage gaps, and cross-module dependencies. Propose exactly ONE improvement as " <>
+  "a unified diff. Your improvement should be in one of these categories:\n\n" <>
+  "- ALGORITHM: Better time complexity, fewer traversals, smarter data structures\n" <>
+  "- CORRECTNESS: Edge cases, error recovery, partial function elimination\n" <>
+  "- ARCHITECTURE: Extract helpers, reduce nesting, improve cohesion\n" <>
+  "- TEST: Add test cases for untested functions (append to test/Spec.hs)\n" <>
+  "- TYPE_SAFETY: More precise types, replace partial functions with total ones, " <>
+  "add {-@ ... @-} LiquidHaskell refinement annotations\n\n" <>
+  "Choose the highest-impact category. Output ONLY the diff. No explanation, no fences."
+
+-- | Like 'proposeMutation' but takes a pre-built semantic prompt with deep
+-- structural analysis.  Used when no GHC warnings exist and the system falls
+-- through to the engineer-grade tier.
+proposeMutationSemantic
+  :: OracleEnv
+  -> FilePath -> Text -> Text   -- ^ file path, source, semantic prompt
+  -> IO (Either Text HsMutation)
+proposeMutationSemantic env fp _src semanticPrompt = do
+  let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
+      bodyLBS = encode $ object
+                  [ "model"    .= oeModel env
+                  , "temperature" .= (0.4 :: Double)
+                  , "max_tokens"  .= (4096 :: Int)
+                  , "messages" .= Aeson.toJSON
+                      [ object [ "role"    .= ("system" :: Text)
+                               , "content" .= oracleSemanticSystemPrompt ]
+                      , object [ "role"    .= ("user" :: Text)
+                               , "content" .= semanticPrompt ]
+                      ]
+                  ]
+  eReq <- try (HTTP.parseRequest url) :: IO (Either SomeException HTTP.Request)
+  case eReq of
+    Left err -> return (Left ("oracle-semantic: bad URL: " <> T.pack (show err)))
+    Right req0 -> do
+      let req = HTTP.setRequestMethod "POST"
+              $ HTTP.addRequestHeader "Content-Type"  "application/json"
+              $ HTTP.addRequestHeader "Authorization"
+                  ("Bearer " <> BS8.pack (T.unpack (oeApiKey env)))
+              $ HTTP.setRequestBodyLBS bodyLBS req0
+      eResp <- try (HTTP.httpLBS req)
+                 :: IO (Either SomeException (HTTP.Response LBS.ByteString))
+      case eResp of
+        Left err   -> return (Left ("oracle-semantic: HTTP error: " <> T.pack (show err)))
+        Right resp -> return $ case Aeson.decode (HTTP.getResponseBody resp) of
+          Nothing                   -> Left "oracle-semantic: JSON decode failed"
+          Just (OracleResponse txt) ->
+            case parseDiffResponse txt of
+              Right hm -> Right hm { hmDescription = "oracle-semantic: " <> hmDescription hm }
+              Left err -> Left err
+
+-- | Propose a coordinated change set across multiple files.
+--
+-- The prompt contains concatenated semantic contexts for all files in the
+-- group.  The Oracle returns one unified diff per file, separated by
+-- @--- a/<path>@ headers.  Returns a list of @(filePath, HsMutation)@ pairs.
+proposeChangeSet
+  :: OracleEnv
+  -> Text                          -- ^ Combined multi-file prompt
+  -> IO (Either Text [(FilePath, HsMutation)])
+proposeChangeSet env combinedPrompt = do
+  let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
+      sysPrompt = oracleSemanticSystemPrompt
+                <> "\n\nYou may produce diffs for MULTIPLE files. "
+                <> "Separate each file's diff with a --- a/<path> header."
+      bodyLBS = encode $ object
+                  [ "model"    .= oeModel env
+                  , "temperature" .= (0.4 :: Double)
+                  , "max_tokens"  .= (8192 :: Int)
+                  , "messages" .= Aeson.toJSON
+                      [ object [ "role"    .= ("system" :: Text)
+                               , "content" .= sysPrompt ]
+                      , object [ "role"    .= ("user" :: Text)
+                               , "content" .= combinedPrompt ]
+                      ]
+                  ]
+  eReq <- try (HTTP.parseRequest url) :: IO (Either SomeException HTTP.Request)
+  case eReq of
+    Left err -> return (Left ("oracle-changeset: bad URL: " <> T.pack (show err)))
+    Right req0 -> do
+      let req = HTTP.setRequestMethod "POST"
+              $ HTTP.addRequestHeader "Content-Type"  "application/json"
+              $ HTTP.addRequestHeader "Authorization"
+                  ("Bearer " <> BS8.pack (T.unpack (oeApiKey env)))
+              $ HTTP.setRequestBodyLBS bodyLBS req0
+      eResp <- try (HTTP.httpLBS req)
+                 :: IO (Either SomeException (HTTP.Response LBS.ByteString))
+      case eResp of
+        Left err   -> return (Left ("oracle-changeset: HTTP error: " <> T.pack (show err)))
+        Right resp -> return $ case Aeson.decode (HTTP.getResponseBody resp) of
+          Nothing                   -> Left "oracle-changeset: JSON decode failed"
+          Just (OracleResponse txt) -> parseMultiFileDiff txt
+
+-- | Parse a multi-file diff response into per-file HsMutations.
+parseMultiFileDiff :: Text -> Either Text [(FilePath, HsMutation)]
+parseMultiFileDiff content =
+  let stripped = stripMarkdownFences content
+      -- Split on "--- a/" headers to identify per-file sections
+      sections = splitOnFileHeaders (T.lines stripped)
+  in case sections of
+       [] -> -- Try as single-file diff
+         case parseDiffResponse stripped of
+           Right hm -> Right [("", hm)]
+           Left err -> Left err
+       pairs -> Right
+         [ (fp, hm)
+         | (fp, diffLines) <- pairs
+         , Right hm <- [parseDiffResponse (T.unlines diffLines)]
+         ]
+
+-- | Split diff lines into (filePath, diffLines) groups.
+splitOnFileHeaders :: [Text] -> [(FilePath, [Text])]
+splitOnFileHeaders = go Nothing []
+  where
+    go Nothing _ [] = []
+    go (Just fp) acc [] = [(fp, reverse acc)]
+    go mFp acc (l:ls)
+      | "--- a/" `T.isPrefixOf` l =
+          let newFp = T.unpack (T.drop 6 (T.strip l))
+              prev  = case mFp of
+                        Nothing -> []
+                        Just fp -> [(fp, reverse acc)]
+          in  prev ++ go (Just newFp) [l] ls
+      | otherwise = go mFp (l:acc) ls
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Diff parsing and application (WITH_ORACLE only)
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -502,6 +633,26 @@ proposeMutationEnriched
   -> FilePath -> Text -> Text
   -> IO (Either Text HsMutation)
 proposeMutationEnriched _env _fp _src _prompt =
+  return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
+
+-- | Like 'proposeMutation' but takes a semantic prompt with deep analysis.
+--
+-- __Stub behaviour__: always returns a @Left@ explanation.
+proposeMutationSemantic
+  :: OracleEnv
+  -> FilePath -> Text -> Text
+  -> IO (Either Text HsMutation)
+proposeMutationSemantic _env _fp _src _prompt =
+  return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
+
+-- | Propose a coordinated change set across multiple files.
+--
+-- __Stub behaviour__: always returns a @Left@ explanation.
+proposeChangeSet
+  :: OracleEnv
+  -> Text
+  -> IO (Either Text [(FilePath, HsMutation)])
+proposeChangeSet _env _prompt =
   return (Left "DGM.Oracle: build with -f+with-oracle to enable LLM mutations")
 
 -- | Score and rank mutations.

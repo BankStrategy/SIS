@@ -1,433 +1,523 @@
-# DGM Haskell — Full Implementation Plan
+# Plan: Semantic Oracle — Engineer-Grade Self-Modification
 
-> **Decision already made:** SQLite for archive persistence. All other
-> stated approaches below are based on study of the existing codebase.
+## Problem Statement
 
----
+The self-modification pipeline works end-to-end but operates at linter level:
+- The Oracle sees raw source with line numbers and is told "propose ONE small safe improvement"
+- The enriched path constrains to "pick ONE from VERIFIED SAFE REMOVALS" (GHC warnings)
+- No type information, call graphs, complexity analysis, or test coverage data reaches the Oracle
+- No failure feedback — when mutations fail, the Oracle doesn't learn why
+- No per-test analysis — only aggregate pass/fail counts
+- No multi-file support — can't propose cross-cutting refactors
+- Scoring is binary (tests pass = 1.0, else reject)
 
-## Current State
-
-The MVP is complete and all 34 tests pass. `cabal run dgm -- 5` runs 5 full
-Zero Data Cycles. The architecture is sound. What remains is replacing the five
-stubs with real implementations, plus one correctness gap in the evolutionary
-loop.
-
-| Gap | File | Status |
-|-----|------|--------|
-| Archive in-memory only | `Archive.hs` | Stub (TVar list) |
-| No real GHC-API eval | `Sandbox.hs` | CPP stub (`#ifdef WITH_HINT`) |
-| No real SMT solver | `Verification.hs` | Bounded test oracle |
-| Rewriting only at root | `Rewriting.hs` | Missing recursive traversal |
-| Trivial quorum hash | `SafetyKernel.hs` | `simpleHash` (not crypto) |
-| Proposer state not threaded | `Cycle.hs` / `AbsoluteZero.hs` | Static difficulty |
+**Goal**: Enable the Oracle to propose semantic changes — algorithmic improvements,
+architectural refactors, test coverage additions, and type safety upgrades — by giving
+it deep structural context and structured feedback loops.
 
 ---
 
-## Phase 1 — SQLite Archive Persistence (P0, implement first)
+## Stage 1: `DGM.SemanticContext` — Deep Module Analysis
 
-**Decision:** SQLite via `sqlite-simple` (already in the Haskell ecosystem, no
-heavy ORM needed). The archive is the core memory of the system; everything
-else depends on it surviving process restarts.
+**New module**: `src/DGM/SemanticContext.hs` (no CPP, no optional flags)
 
-### What to change
-
-**`dgm.cabal`** — add dependency:
-```
-sqlite-simple >= 0.4
-```
-
-Add a new cabal flag `with-sqlite` (default True) mirroring the `with-hint`
-pattern, so CI without SQLite can still build.
-
-**`src/DGM/Archive.hs`** — add a persistence layer alongside the existing STM
-layer:
+### Types
 
 ```haskell
--- New types
-data ArchiveBackend
-  = InMemory                    -- existing TVar backend
-  | SQLiteBacked FilePath       -- new: path to .db file
-
--- New operations
-openArchive  :: ArchiveBackend -> IO ArchiveHandle
-closeArchive :: ArchiveHandle  -> IO ()
-flushArchive :: ArchiveHandle  -> [ArchiveEntry] -> IO ()
-loadArchive  :: ArchiveHandle  -> IO [ArchiveEntry]
-```
-
-Schema (one table, append-only):
-
-```sql
-CREATE TABLE IF NOT EXISTS archive_entries (
-  id          TEXT PRIMARY KEY,
-  code        TEXT NOT NULL,
-  parent_id   TEXT,
-  score       REAL NOT NULL,
-  passed      INTEGER NOT NULL,   -- 0/1
-  generation  INTEGER NOT NULL,
-  counter_ex  TEXT                -- JSON, nullable
-);
-```
-
-**`src/DGM/Types.hs`** — add `ArchiveEntry` `ToJSON`/`FromJSON` instances to
-`DGM.Types` (moving them from `Archive.hs` orphans, fixing the existing
-`-Worphans` warnings).
-
-**`src/DGM/Cycle.hs`** — after each `archiveSuccess` / `archiveFailed` call,
-flush to SQLite. On startup (`newAgentState`), load any persisted entries back
-into the `TVar`.
-
-**Integration point:** `newAgentState` gains an `ArchiveBackend` parameter. The
-default in `app/Main.hs` becomes `SQLiteBacked "dgm-archive.db"`.
-
-### Acceptance criteria
-- `cabal run dgm -- 5 && cabal run dgm -- 5` — second run shows >0 entries
-  already in archive at startup (stepping stones survive restart).
-- `dgm-archive.db` exists after first run and grows monotonically.
-- All 34 existing tests still pass (use `InMemory` backend in tests).
-
----
-
-## Phase 2 — Recursive Rewriting via Cata (P1)
-
-**This is the most impactful correctness fix.** `generateMutations` currently
-only fires rules at the root of the expression. The DGM's evolutionary pressure
-depends on exploring mutations throughout the tree.
-
-### What to change
-
-**`src/DGM/Rewriting.hs`** — replace `generateMutations`:
-
-```haskell
--- Current (root-only):
-generateMutations :: RuleSet -> Expr -> [(Expr, Mutation)]
-generateMutations rules expr =
-  mapMaybe (applyRule expr) rules
-
--- New (full tree via paramorphism):
-generateMutations :: RuleSet -> Expr -> [(Expr, Mutation)]
-generateMutations rules expr =
-  concatMap (\(path, subexpr) ->
-    mapMaybe (applyRuleAt path subexpr) rules)
-  (subterms expr)
-```
-
-Use a paramorphism (`para`) to collect all subterms with their reconstruction
-contexts (zipper-style), apply each rule at each position, and reconstruct the
-full expression with the rule fired at that position.
-
-Concrete approach — implement `Zipper` (or simpler: list of `(Expr, Expr ->
-Expr)` pairs representing subterm + context) and rewrite via:
-
-```haskell
--- Collect (subexpr, plug) pairs
-subtermsWithCtx :: Expr -> [(Expr, Expr -> Expr)]
-subtermsWithCtx = para $ \case
-  -- Each functor position contributes its subterm + a plug function
-  AppF (fe, fCtx) (xe, xCtx) ->
-    (Fix (AppF fe xe), id)              -- root
-    : [(e, \e' -> Fix (AppF e' xe)) | (e, _) <- fCtx]   -- left
-    ++ [(e, \e' -> Fix (AppF fe e')) | (e, _) <- xCtx]  -- right
-  ...
-```
-
-This is a standard zipper traversal. The generated mutation count grows
-proportionally to tree depth — many more candidates to score.
-
-**`src/DGM/Evolution.hs`** — no changes needed; `unfoldHypotheses` already
-calls `generateMutations` and will benefit automatically.
-
-### Acceptance criteria
-- New test: `generateMutations` on `(2 + 3) * (x + 0)` finds both the
-  constant-fold `(2+3) → 5` and the identity-elim `(x+0) → x`.
-- 35 tests pass (one added).
-- `cabal run dgm -- 10` shows more archive entries with non-zero scores
-  (mutations now fire on subterms).
-
----
-
-## Phase 3 — Real GHC-API Dynamic Eval via hint (P1)
-
-The `with-hint` flag and CPP guard already exist. This phase wires it up fully.
-
-### What to change
-
-**`dgm.cabal`** — `hint >= 0.9` already listed under `if flag(with-hint)`. No
-cabal change needed.
-
-**`src/DGM/Sandbox.hs`** — complete `hintEval`:
-
-```haskell
-#ifdef WITH_HINT
-hintEval :: SandboxConfig -> Text -> IO SandboxResult
-hintEval cfg code = do
-  let src = T.unpack code
-  result <- race (delay (rlTimeoutMs (scLimits cfg))) (runHint cfg src)
-  ...
-
-runHint :: SandboxConfig -> String -> IO (Either String String)
-runHint cfg src = do
-  res <- runInterpreter $ do
-    reset
-    setImports (scImports cfg)
-    when (scSafeOnly cfg) $ set [languageExtensions := [SafeHaskell]]
-    interpret src (as :: String)
-  pure $ case res of
-    Left  err -> Left (displayException err)
-    Right v   -> Right v
-#endif
-```
-
-Key addition: `set [languageExtensions := [SafeHaskell]]` enforces Safe Haskell
-module restrictions when `scSafeOnly = True`. This matches the SPEC.md §2.2.2
-requirement for the Capability Sandbox tier.
-
-**`src/DGM/Sandbox.hs`** — fix `runInSandbox` to use the `cfg` parameter
-(currently unused, causing a warning):
-
-```haskell
-runInSandbox cfg code = do
-  t0 <- getCurrentTime
-#ifdef WITH_HINT
-  result <- hintEval cfg code
-#else
-  result <- pureEval code
-#endif
-  t1 <- getCurrentTime
-  let latMs = realToFrac (diffUTCTime t1 t0) * 1000
-  pure result { srLatencyMs = latMs }
-```
-
-**Build gate:** `cabal build -f+with-hint` must compile without errors. The
-test suite runs with `with-hint` disabled (no GHC in CI path); add an
-integration test executable that enables the flag.
-
-### Acceptance criteria
-- `cabal build -f+with-hint` compiles clean.
-- `cabal run dgm -f+with-hint -- 5` produces identical cycle output to the
-  non-hint build (the `runExprInSandbox` path is preferred for AST-based work;
-  hint path activates for `runInSandbox` with text code).
-- Safe Haskell violations (e.g. `unsafePerformIO`) are rejected by the sandbox.
-
----
-
-## Phase 4 — Real SMT via SBV (P2)
-
-The bounded test oracle in `verifyEquivalence` is sound but incomplete. Full
-SMT via Z3/SBV turns `Verified` from "no counter-example found in N tests" to
-a genuine proof.
-
-### What to change
-
-**`dgm.cabal`** — add flag and dependency:
-
-```
-flag with-sbv
-  description: Enable real SMT verification via SBV/Z3
-  default:     False
-  manual:      True
-
-if flag(with-sbv)
-  build-depends: sbv >= 10.0
-  cpp-options: -DWITH_SBV
-```
-
-**`src/DGM/Verification.hs`** — replace the pure loop in `verifyEquivalence`
-with an SBV symbolic check when `WITH_SBV` is defined:
-
-```haskell
-#ifdef WITH_SBV
-import Data.SBV
-
-verifyEquivalence :: EquivSpec -> IO VerificationResult
-verifyEquivalence spec = do
-  -- Build SBV symbolic expressions from esOriginal and esMutated
-  result <- prove $ do
-    inputs <- mkInputs (esInputDomain spec)   -- symbolic Int/Bool vars
-    let lhs = toSBV inputs (esOriginal spec)
-        rhs = toSBV inputs (esMutated spec)
-    pure (lhs .== rhs)
-  case result of
-    ThmResult (Satisfiable _ _) ->
-      pure (Falsifiable (extractCE result))
-    ThmResult (Unsatisfiable _ _) ->
-      pure (Verified "Q.E.D. via SBV/Z3")
-    _ ->
-      pure (VTimeout "SBV returned unknown/timeout")
-#else
--- existing bounded oracle
-#endif
-```
-
-**`toSBV`** — a catamorphism over `ExprF` to `SBV SInteger` / `SBV SBool`.
-Only `LitF`, `BoolF`, `BinOpF` (`+`,`-`,`*`,`==`,`<`,`>`), `IfF`, and `VarF`
-need symbolic representations. `LamF`/`LetF`/`AppF` remain outside scope for
-the MVP SBV port (these would require higher-order symbolic reasoning).
-
-**Fallback:** When the expression contains `LamF`/`AppF` (higher-order terms),
-fall back to the bounded test oracle. Log `VTimeout "HOF: fell back to oracle"`.
-
-### Acceptance criteria
-- `cabal build -f+with-sbv` compiles (requires Z3 in PATH).
-- `verifyEquivalence` on `2+3` vs `5` returns `Verified "Q.E.D. via SBV/Z3"`.
-- `verifyEquivalence` on `x+1` vs `x` returns `Falsifiable` with a concrete
-  counter-example from Z3.
-- 34 existing tests pass with `with-sbv` disabled.
-
----
-
-## Phase 5 — Proposer Difficulty Adaptation (P2)
-
-**The bug:** `runCycleN` ignores the updated `Proposer` returned by
-`runSelfPlayStep`. Each cycle restarts at `propCurrentDifficulty = 0.2`.
-The system never adapts.
-
-### What to change
-
-**`src/DGM/Cycle.hs`** — thread `Proposer` state through the cycle loop:
-
-```haskell
-data CycleConfig = CycleConfig
-  { ...
-  , ccProposer :: TVar Proposer   -- was: embedded in SelfPlayConfig
+data FunctionInfo = FunctionInfo
+  { fiName       :: !Text           -- "buildModuleGraph"
+  , fiTypeSig    :: Maybe Text      -- ":: [FilePath] -> IO ModuleGraph"
+  , fiLineStart  :: !Int            -- first line of definition
+  , fiLineCount  :: !Int            -- body length in lines
+  , fiCalls      :: [Text]          -- other top-level names referenced in body
+  , fiComplexity :: !Int            -- heuristic: cases + guards + wheres + depth
   }
 
--- In runCycle:
-runCycle :: CycleConfig -> IO [StepResult]
-runCycle cfg = do
-  prop <- atomically (readTVar (ccProposer cfg))
-  let spCfg = (ccSelfPlayCfg cfg) { spProposer = prop }
-  (newProp, solverResult) <- runSelfPlayStep spCfg
-  atomically (writeTVar (ccProposer cfg) newProp)   -- commit updated difficulty
-  ...
+data TestMapping = TestMapping
+  { tmTestName   :: !Text           -- "buildModuleGraph: core DGM modules import..."
+  , tmTestedFunc :: !Text           -- "buildModuleGraph"
+  , tmTestFile   :: !FilePath       -- "test/Spec.hs"
+  }
 
--- In runCycleN: no change needed (TVar handles it)
+data SemanticContext = SemanticContext
+  { scFilePath       :: !FilePath
+  , scModuleName     :: !Text
+  , scFunctions      :: [FunctionInfo]
+  , scTestCoverage   :: [TestMapping]      -- which tests cover which functions
+  , scUntestedExports:: [Text]             -- exported functions with 0 test matches
+  , scUsedBy         :: [(Text, [Text])]   -- (export, [importing modules])
+  , scRecentFailures :: [(Text, Text)]     -- (mutation desc, failure reason) from archive
+  , scWarnings       :: [GhcWarning]       -- from OracleContext (already collected)
+  }
 ```
 
-**`src/DGM/AbsoluteZero.hs`** — `runSelfPlayStep` already returns `(Proposer,
-SolverResult)`. No change needed there.
+### Implementation
 
-**`app/Main.hs`** — initialize `ccProposer` from a TVar wrapping
-`defaultProposer`.
+**`extractFunctions :: Text -> [FunctionInfo]`** (pure text analysis):
+- Scan for `name :: Type` lines → record type signatures
+- Scan for `name arg1 arg2 ... =` or `name = do` lines → function start
+- Track body extent via indentation (next top-level definition or end of file = end)
+- Count complexity: `case`, `|` guards, `where`, `let ... in`, nested lambdas
+- Extract callee names: all identifiers in body matching other top-level names
 
-### Acceptance criteria
-- New test: after 5 self-play steps starting at difficulty 0.2, `propCurrentDifficulty`
-  is > 0.2 (adaptation happened).
-- `cabal run dgm -- 20` shows increasing task IDs over time (harder tasks
-  proposed as capability grows).
+**`buildTestCoverage :: [FilePath] -> [FunctionInfo] -> IO [TestMapping]`**:
+- Read `test/Spec.hs` (and any other `*Spec.hs` or `*Test.hs` files)
+- Parse test names from `testCase "description"` and `testProperty "description"`
+- Match function names to test descriptions (substring match on function name in test string)
+- Return mapping of test → tested function
+
+**`buildSemanticContext`**: Composes extractFunctions + buildTestCoverage + ModuleGraph
+lookups + archive failure queries into a full `SemanticContext`.
+
+### Files touched
+- New: `src/DGM/SemanticContext.hs`
+- Edit: `dgm.cabal` (add to exposed-modules)
+- Edit: `test/Spec.hs` (add tests for extractFunctions, buildTestCoverage)
 
 ---
 
-## Phase 6 — Cryptographic QuorumProof (P3)
+## Stage 2: Semantic Oracle Prompting
 
-**Current:** `simpleHash` is a `mod 1000000` of character codes. Trivially
-collides and forgeable.
+**Edit modules**: `Oracle.hs`, `OracleContext.hs`, `OracleHandle.hs`, `SelfMod.hs`
 
-### What to change
+### New system prompt (engineer-grade)
 
-**`dgm.cabal`** — add:
+Replace the generic "propose ONE small, safe improvement" with:
+
 ```
-cryptohash-sha256 >= 0.11
-base16-bytestring >= 1.0
+You are a senior Haskell engineer reviewing a module for improvement. You receive
+deep structural analysis including type signatures, complexity metrics, test
+coverage gaps, and cross-module dependencies. Propose exactly ONE improvement as
+a unified diff. Your improvement should be in one of these categories:
+
+- ALGORITHM: Better time complexity, fewer traversals, smarter data structures
+- CORRECTNESS: Edge cases, error recovery, partial function elimination
+- ARCHITECTURE: Extract helpers, reduce nesting, improve cohesion
+- TEST: Add test cases for untested functions (append to test/Spec.hs)
+- TYPE_SAFETY: More precise types, replace partial functions with total ones
+
+Choose the highest-impact category for this module. Output ONLY the diff.
+No explanation, no markdown fences.
 ```
 
-**`src/DGM/SafetyKernel.hs`** — replace `simpleHash`:
+### User prompt structure
+
+```
+## MODULE: DGM/ModGraph.hs
+
+### TYPE SIGNATURES
+buildModuleGraph :: [FilePath] -> IO ModuleGraph
+moduleImpact :: ModuleGraph -> FilePath -> HsMutation -> HsModule -> Int
+numDependents :: ModuleGraph -> FilePath -> Int
+
+### FUNCTION COMPLEXITY (lines / complexity score)
+extractExports: 15 lines, complexity 8 (3 cases, 2 guards, 1 where)
+buildModuleGraph: 12 lines, complexity 5 (1 case, 2 binds)
+moduleImpact: 3 lines, complexity 2
+
+### TEST COVERAGE
+buildModuleGraph: TESTED (3 tests)
+numDependents: TESTED (2 tests)
+moduleImpact: NOT TESTED  <-- improvement target
+extractExports: TESTED (4 tests)
+
+### CROSS-MODULE USAGE
+buildModuleGraph: Cycle.hs (1x)
+moduleImpact: SelfMod.hs (1x)
+extractExports: internal only
+
+### GHC WARNINGS
+(any current -Wall warnings for this file)
+
+### PAST FAILURES (if any)
+Last attempt "refactor extractExports" failed:
+  Type error line 182: Couldn't match '[Text]' with 'Maybe [Text]'
+
+### SOURCE
+---
+1  module DGM.ModGraph ...
+...
+---
+
+Produce a unified diff for the highest-impact improvement.
+```
+
+### Three prompt tiers (dispatched by context richness)
+
+1. **Enriched (GHC warnings present)**: Keep existing enriched path for lint removals
+   — it works and has high success rate. This is the "quick win" tier.
+
+2. **Semantic (no warnings, rich context)**: New path using SemanticContext.
+   Higher temperature (0.4) to encourage creative proposals. This is the
+   "engineer-grade" tier.
+
+3. **Standard (fallback)**: Current generic prompt as last resort when no
+   semantic context is available.
+
+### Oracle.hs changes
+
+- Add `proposeMutationSemantic :: OracleEnv -> FilePath -> Text -> Text -> IO (Either Text HsMutation)`
+  - Takes the semantic prompt as pre-built Text
+  - Uses new system prompt (engineer-grade, above)
+  - Temperature 0.4 (more exploratory than enriched 0.2, more creative than standard 0.3)
+  - Description prefix: `"oracle-semantic: "`
+
+- Add to OracleHandle: `proposeMutationSemanticH`
+
+### OracleContext.hs changes
+
+- Add `buildSemanticPrompt :: SemanticContext -> Maybe MutationContext -> Text`
+  - Formats the full semantic prompt from SemanticContext
+  - Always returns content (unlike buildEnrichedPrompt which returns Nothing when no warnings)
+
+### SelfMod.hs dispatch logic changes
+
+In `proposeSelfMutations`, per-file dispatch becomes:
+1. If GHC warnings exist for this file → enriched prompt (lint tier, existing)
+2. Else → build SemanticContext → semantic prompt (engineer tier, new)
+3. If SemanticContext unavailable → standard prompt (fallback, existing)
+
+### Files touched
+- Edit: `src/DGM/Oracle.hs` (new proposeMutationSemantic, new system prompt)
+- Edit: `src/DGM/OracleHandle.hs` (expose proposeMutationSemanticH)
+- Edit: `src/DGM/OracleContext.hs` (add buildSemanticPrompt)
+- Edit: `src/DGM/SelfMod.hs` (three-tier dispatch)
+- Edit: `test/Spec.hs` (tests for buildSemanticPrompt formatting)
+
+---
+
+## Stage 3: Error Feedback Loop
+
+**Goal**: When a mutation fails, capture WHY and feed it back to the Oracle on the
+next attempt for the same file.
+
+### ArchiveEntry extension
+
+Add field to `Types.hs`:
+```haskell
+  , entryFailureReason :: Maybe Text
+    -- ^ Structured failure reason: GHC error text, or failed test names.
+    -- Populated on failure; Nothing on success.
+```
+
+### Failure capture in Cycle.hs
+
+In `runMutationPipeline`, when `txnResult = Left err`:
+- `err` already contains failure text ("Build pre-flight: ...", "Tests degraded, score=0.5")
+- For build failures: `crErrors` from CompileResult has the GHC error output
+- Store first 500 chars of error as `entryFailureReason`
+
+Specifically:
+- Build preflight failure → capture GHC error lines from stderr
+- LH failure → capture "UNSAFE: `<details>`"
+- Test failure → capture `crErrors` from CompileResult (test output with names)
+
+### Failure retrieval
+
+Add to `Archive.hs`:
+```haskell
+getRecentFailures :: TVar [ArchiveEntry] -> FilePath -> STM [(Text, Text)]
+```
+- Filters by `mutationTarget == filePath && not entryPassed`
+- Returns `(entryCode, fromMaybe "" entryFailureReason)` pairs
+- Most recent first, limit 3
+
+`SemanticContext.scRecentFailures` is populated from this query. The semantic
+prompt includes a "PAST FAILURES" section showing the last 3 failed mutations
+for this file with their error messages, so the Oracle doesn't repeat mistakes.
+
+### SQLite schema migration
+
+Add column: `failure_reason TEXT` to `archive_entries` table.
+On startup, `ALTER TABLE IF NOT EXISTS` (SQLite gracefully handles existing tables).
+
+### Files touched
+- Edit: `src/DGM/Types.hs` (add entryFailureReason to ArchiveEntry + LH annotation + JSON)
+- Edit: `src/DGM/Cycle.hs` (capture failure reason in archive entries)
+- Edit: `src/DGM/Archive.hs` (add getRecentFailures query, SQLite column)
+- Edit: `src/DGM/SemanticContext.hs` (consume failure data)
+- Edit: `test/Spec.hs` (test failure capture and retrieval)
+
+---
+
+## Stage 4: Per-Test-Case Analysis
+
+**Goal**: Parse individual test names from `cabal test` output so the Oracle knows
+exactly which tests failed and can reason about specific test coverage.
+
+### SelfCompile.hs changes
+
+Add `parseTestDetails :: String -> [(Text, Bool)]`:
+- Parse tasty's `--test-show-details=direct` output format
+- Each line like `    functionName: test description:    OK` → (name, True)
+- Each line like `    functionName: test description:    FAIL` → (name, False)
+- Handles indentation and multiline output
+- Return list of (test name, passed?)
+
+Extend `CompileResult`:
+```haskell
+data CompileResult
+  = CompileSuccess
+      { crTestsPassed  :: Int
+      , crTestsFailed  :: Int
+      , crLatencyMs    :: Double
+      , crFailedTests  :: [Text]   -- NEW: names of specific failed tests
+      }
+  | CompileFailure { crErrors :: Text, crPhase :: CompilePhase }
+```
+
+### Integration with error feedback (Stage 3)
+
+When tests fail (score < 1.0):
+- `crFailedTests` tells us exactly which tests broke
+- Store as part of `entryFailureReason`: "Tests failed: [test1, test2, ...]"
+- Oracle sees on next attempt: "Last mutation broke tests: test1, test2"
+
+### Integration with SemanticContext (Stage 1)
+
+`scTestCoverage` can now include pass/fail status from the most recent test run:
+- "buildModuleGraph: TESTED (3 tests, all passing)"
+- "moduleImpact: NOT TESTED"
+
+### Files touched
+- Edit: `src/DGM/SelfCompile.hs` (parseTestDetails, extend CompileResult)
+- Edit: `src/DGM/Cycle.hs` (use crFailedTests in error feedback)
+- Edit: `test/Spec.hs` (test parseTestDetails with various tasty output formats)
+
+---
+
+## Stage 5: Multi-File Change Sets
+
+**Goal**: Allow the Oracle to propose coordinated changes across multiple modules.
+
+### New type in Types.hs
 
 ```haskell
-import qualified Crypto.Hash.SHA256 as SHA256
-import qualified Data.ByteString.Base16 as B16
-import Data.Text.Encoding (encodeUtf8, decodeUtf8)
-
--- Real SHA-256 hash
-simpleHash :: Text -> Text
-simpleHash t =
-  decodeUtf8 (B16.encode (SHA256.hash (encodeUtf8 t)))
+data ChangeSet = ChangeSet
+  { csDescription :: !Text
+  , csDiffs       :: [(FilePath, HsMutation)]
+  }
 ```
 
-`QuorumProof` generation (`mockQuorumProof`) becomes the production path for
-single-party proofs. For multi-party quorum (SPEC.md §3.2), the type would
-extend to carry `[Signature]` but this is out of MVP scope.
+### Oracle.hs: Multi-file prompt mode
 
-**`src/DGM/Types.hs`** — extend `QuorumProof` with a timestamp to prevent
-replay attacks:
+New function `proposeChangeSet`:
+- System prompt: "You are reviewing multiple related Haskell modules. Propose a
+  coordinated change that improves the system as a whole. You may modify any or
+  all of the modules below. Output unified diffs for each file, separated by
+  file headers."
+- User prompt: concatenated semantic contexts for 2-3 related modules
+  (grouped by ModuleGraph adjacency — modules that import each other)
+- Response format: multiple `--- a/path` / `+++ b/path` diff blocks
+- Parse into `ChangeSet` (multiple diffs keyed by filepath)
+
+### Diff parser extension
+
+Extend `parseDiffResponse` to handle multi-file diffs:
+- Split on `--- a/src/DGM/` or `--- src/DGM/` boundaries
+- Each block becomes a separate `HsMutation` paired with its filepath
+- Return `Either Text ChangeSet` instead of `Either Text HsMutation`
+
+Fallback: if multi-file diff is unparseable, try treating entire response as
+single-file diff (current behavior).
+
+### Cycle.hs: Atomic multi-file pipeline
+
+New `runChangeSetPipeline`:
+1. Snapshot all affected files (like SelfModTxn but for N files)
+2. Write all mutations
+3. Run buildPreflight once
+4. Run testSelf once
+5. On success: commit all files in one git commit with combined description
+6. On failure: rollback ALL files to snapshots
+
+### SelfMod.hs: Module grouping
+
+New `groupRelatedModules :: ModuleGraph -> [FilePath] -> [[FilePath]]`:
+- Group files by mutual import relationships (transitive closure, capped at 3)
+- Each group = 2-3 tightly-coupled modules
+- One multi-file proposal per group (instead of per-file)
+
+### Activation criteria
+
+Multi-file mode activates when:
+- Single-file mutations for a module have accumulated 3+ blacklist entries
+- The file has high cross-module coupling (mgUsedBy count > 2)
+- `--goal` explicitly targets cross-cutting concerns
+
+Otherwise, single-file mode is used (it's more reliable and cheaper).
+
+### Files touched
+- Edit: `src/DGM/Types.hs` (add ChangeSet type)
+- Edit: `src/DGM/Oracle.hs` (proposeChangeSet, multi-file diff parser)
+- Edit: `src/DGM/OracleHandle.hs` (expose proposeChangeSetH)
+- Edit: `src/DGM/Cycle.hs` (runChangeSetPipeline, atomic multi-file commit)
+- Edit: `src/DGM/SelfMod.hs` (groupRelatedModules, dispatch to multi-file)
+- Edit: `src/DGM/SelfCompile.hs` (multi-file SelfModTxn variant)
+- Edit: `test/Spec.hs` (test multi-file diff parsing, module grouping)
+
+---
+
+## Stage 6: Quality-Aware Scoring
+
+**Goal**: Score mutations by improvement quality, not just binary pass/fail.
+
+### enrichScore extension in SelfCompile.hs
 
 ```haskell
-data QuorumProof = QuorumProof
-  { quorumHash      :: Text
-  , quorumTimestamp :: Int64   -- POSIX seconds
-  , quorumOperation :: Text    -- what this proof authorises
-  } deriving (Show, Eq)
+enrichScoreV2
+  :: Double          -- base score (pass/fail)
+  -> Int -> Int      -- origLen, mutLen
+  -> Maybe Text      -- LH result
+  -> Maybe Int       -- complexity delta (negative = improvement)
+  -> Maybe Int       -- coverage delta (positive = new tests added)
+  -> Bool            -- is this mutation category novel for this file?
+  -> Double
+
+-- Bonuses (all additive, capped at 1.0):
+-- sizeBonus:       0.05 * max(0, origLen - mutLen) / origLen  (existing)
+-- lhBonus:         0.02 if "SAFE"                             (existing)
+-- complexityBonus: 0.03 * max(0, -complexityDelta) / maxComplexity
+-- coverageBonus:   0.04 if new tests added (coverage delta > 0)
+-- noveltyBonus:    0.01 if mutation category is first for this file
 ```
 
-Update `verifyQuorum` to also check `|now - quorumTimestamp| < 300` (5-minute
-window).
+### Complexity measurement
 
-### Acceptance criteria
-- Existing quorum tests pass with SHA-256 backend.
-- A proof generated for operation "terminate" is rejected when presented for
-  operation "write:/etc/passwd".
-- A proof with timestamp 6 minutes old is rejected.
+Before and after mutation:
+- `extractFunctions` on original source → sum of fiComplexity
+- `extractFunctions` on mutated source → sum of fiComplexity
+- Delta = new - old (negative = improvement, triggers bonus)
+
+### Test coverage measurement
+
+Before and after mutation:
+- Count test matches for functions in this file
+- If mutated source adds new `testCase`/`testProperty` → positive delta
+- This specifically rewards the TEST mutation category
+
+### Accept threshold
+
+Keep `score >= 1.0` as the commit threshold.
+Bonuses don't change the threshold, but they DO affect archive scoring:
+- Higher-quality mutations get higher archive scores
+- RuleMiner pattern matching sees higher scores for quality improvements
+- Future mutation ranking boosts files where quality improvements worked
+
+### Files touched
+- Edit: `src/DGM/SelfCompile.hs` (enrichScoreV2 with complexity/coverage bonuses)
+- Edit: `src/DGM/Cycle.hs` (compute complexity/coverage deltas, pass to enrichScoreV2)
+- Edit: `src/DGM/SemanticContext.hs` (export complexity scoring for before/after comparison)
+- Edit: `test/Spec.hs` (test enrichScoreV2 bonus calculations)
 
 ---
 
-## Dependency Graph
+## Stage 7: Meaningful Verification
+
+**Goal**: Make the formal verification layer do real work.
+
+### LiquidHaskell: Annotation-aware checking
+
+Instead of only checking existing annotations (there are few/none), teach the
+Oracle to ADD refinement type annotations as part of its mutations.
+
+Add to the semantic prompt categories:
+```
+- TYPE_SAFETY: More precise types, replace partial functions with total ones.
+  You may add LiquidHaskell {-@ ... @-} refinement type annotations to strengthen
+  type safety. These will be verified by LiquidHaskell.
+```
+
+When LH is enabled and the mutation adds `{-@ ... @-}` annotations:
+- LH verifies them against the code
+- If SAFE: the mutation is formally verified (real LH bonus = 0.02)
+- If UNSAFE: the annotation is wrong (reject, archive with failure reason)
+
+### Property-based testing via QuickCheck (TEST category)
+
+The Oracle can propose QuickCheck properties as part of TEST mutations:
+```haskell
+testProperty "numDependents is non-negative" $
+  forAll arbitrary $ \mg fp ->
+    numDependents mg fp >= 0
+```
+
+These get verified by `cabal test` in the pipeline. If they pass, the mutation
+adds test coverage AND serves as a living specification.
+
+### SBV: Keep skipped for source mutations
+
+SBV verification remains skipped for source-level mutations (no ExprF
+representation). It stays active for ExprPhase cycles where it has actual
+expressions. This is the honest position — SBV can't meaningfully verify
+text-level Haskell diffs.
+
+### Files touched
+- Edit: `src/DGM/Oracle.hs` (LH annotation mention in semantic prompt)
+- Edit: `src/DGM/Liquid.hs` (detect added annotations in output)
+- Edit: `test/Spec.hs` (tests)
+
+---
+
+## Implementation Order and Dependencies
 
 ```
-Phase 1 (SQLite)         ← independent, implement first
-    ↓
-Phase 2 (recursive rw)  ← depends on nothing, implement in parallel with Phase 1
-    ↓
-Phase 5 (proposer)      ← depends on Phase 2 (more mutations → more accurate capability)
-    ↓
-Phase 3 (hint)          ← depends on Phase 1 (archive persists hint results)
-Phase 4 (SBV)           ← depends on Phase 1 (archive persists proofs)
-Phase 6 (crypto)        ← depends on nothing (pure replacement)
+Stage 1: SemanticContext          <-- Foundation (no dependencies)
+    |
+Stage 2: Semantic Prompting       <-- Depends on Stage 1
+    |
+Stage 3: Error Feedback Loop      <-- Independent (can parallel with Stage 2)
+    |
+Stage 4: Per-Test Analysis        <-- Enhances Stage 3
+    |
+Stage 5: Multi-File Change Sets   <-- Depends on Stages 1-4
+    |
+Stage 6: Quality Scoring          <-- Depends on Stage 1 (complexity)
+    |
+Stage 7: Meaningful Verification  <-- Depends on Stages 2, 6
 ```
 
-Recommended order: **1 → 2 → 5 → 6 → 3 → 4**
+**Recommended execution order**: 1 → 2+3 parallel → 4 → 6 → 5 → 7
 
-Phases 3 and 4 can be deferred — they require external tooling (GHC in PATH,
-Z3 in PATH) and their stubs are already functional fallbacks.
-
----
-
-## File Change Summary
-
-| Phase | Files modified | New deps |
-|-------|---------------|----------|
-| 1 SQLite | `Archive.hs`, `Types.hs`, `Cycle.hs`, `dgm.cabal`, `app/Main.hs` | `sqlite-simple` |
-| 2 Recursive rewrite | `Rewriting.hs`, `test/Spec.hs` | none |
-| 3 hint GHC eval | `Sandbox.hs` | `hint` (already listed) |
-| 4 SBV SMT | `Verification.hs`, `dgm.cabal` | `sbv` |
-| 5 Proposer adapt | `Cycle.hs`, `Types.hs`?, `app/Main.hs` | none |
-| 6 Crypto quorum | `SafetyKernel.hs`, `Types.hs`, `dgm.cabal` | `cryptohash-sha256`, `base16-bytestring` |
+Each stage is independently testable and deployable. After each stage, run
+`--self-mod 3` to verify the pipeline still works and measure improvement
+in mutation quality.
 
 ---
 
-## Test Plan (per phase)
+## Success Metrics
 
-Each phase adds tests; the existing 34 must always stay green.
+After full implementation, measure against current baseline:
 
-| Phase | New tests | Total |
-|-------|-----------|-------|
-| 1 | 3 (open/write/reload SQLite) | 37 |
-| 2 | 2 (recursive mutations found, subterm count) | 39 |
-| 3 | 2 (hint eval pass, Safe Haskell reject) — integration only | 39 |
-| 4 | 2 (SBV Q.E.D., SBV counter-example) — integration only | 39 |
-| 5 | 1 (capability adapts after N steps) | 40 |
-| 6 | 2 (SHA-256 hash, timestamp replay reject) | 42 |
+| Metric | Current | Target |
+|--------|---------|--------|
+| Mutation types | Lint only (unused imports, sortBy→sortOn) | Algorithm, architecture, test, type safety |
+| CPP module coverage | 0% → fixed to ~55% | 100% (all files eligible) |
+| Oracle context | Raw source + line numbers | Type sigs + complexity + tests + call graph + failures |
+| Oracle pass rate | ~30% | ~50% (semantic context reduces blind guessing) |
+| Failure learning | None (blacklist only) | Feed back GHC errors, failed test names |
+| Per-test granularity | Aggregate counts only | Individual test name + pass/fail |
+| Multi-file refactors | Impossible | Supported (atomic apply/test/commit) |
+| Test coverage mutations | None | Oracle can add QuickCheck properties |
+| Scoring granularity | Binary pass/fail | Complexity + coverage + novelty bonuses |
+| Formal verification | Hollow | Real LH checks on Oracle-proposed annotations |
 
 ---
 
-## Known Non-Goals (this plan)
+## Files Summary (all stages)
 
-- **LiquidHaskell type-checked refinements** — the runtime predicate approach
-  in `Verification.hs` is the right MVP; full LiquidHaskell requires a
-  separate GHC plugin toolchain.
-- **Process-isolated sandbox (cgroups/seccomp)** — the `async`-timeout sandbox
-  is adequate for the Haskell-expression language used here. Full OS
-  sandboxing (Docker, gVisor) is infrastructure work, not Haskell code.
-- **Multi-party quorum signatures** — Phase 6 gives cryptographic hashes;
-  threshold signatures (SPEC.md §3.2) require key management infrastructure.
-- **GHC `HsExpr` AST** — the `ExprF` language is intentionally simpler than
-  GHC's full AST. Replacing it is a complete rewrite, not an incremental step.
+**New files:**
+- `src/DGM/SemanticContext.hs`
+
+**Modified files:**
+- `src/DGM/Types.hs` — `ArchiveEntry.entryFailureReason`, `ChangeSet` type
+- `src/DGM/Oracle.hs` — `proposeMutationSemantic`, `proposeChangeSet`, new system prompts, multi-file parser
+- `src/DGM/OracleHandle.hs` — expose new handle functions
+- `src/DGM/OracleContext.hs` — `buildSemanticPrompt`
+- `src/DGM/SelfMod.hs` — three-tier dispatch, `groupRelatedModules`
+- `src/DGM/SelfCompile.hs` — `parseTestDetails`, `enrichScoreV2`, `crFailedTests`, multi-file txn
+- `src/DGM/Cycle.hs` — failure capture, complexity/coverage deltas, `runChangeSetPipeline`
+- `src/DGM/Archive.hs` — `getRecentFailures`, SQLite schema migration
+- `src/DGM/Liquid.hs` — annotation detection
+- `dgm.cabal` — add SemanticContext to exposed-modules
+- `test/Spec.hs` — tests for all new functionality

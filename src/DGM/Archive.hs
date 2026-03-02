@@ -15,6 +15,7 @@ module DGM.Archive
   , getBest
   , sampleWeighted
   , getLineage
+  , getRecentFailures
     -- * Statistics
   , ArchiveStats(..)
   , computeStats
@@ -49,6 +50,7 @@ import qualified Data.Text.Encoding as TE
 import DGM.Types
 
 #ifdef WITH_SQLITE
+import Control.Exception (SomeException, try)
 import qualified Database.SQLite.Simple as SQL
 #endif
 
@@ -108,6 +110,25 @@ getLineage archVar entryId0 = do
           in  case entryParentId e of
                 Nothing  -> acc'
                 Just pid -> buildChain byId pid acc'
+
+-- | Retrieve the most recent failure reasons for mutations targeting a file.
+--
+-- Returns up to 3 @(mutationDescription, failureReason)@ pairs, most recent
+-- first.  Only includes entries where @entryPassed == False@ and
+-- @entryFailureReason /= Nothing@.
+getRecentFailures :: TVar [ArchiveEntry] -> FilePath -> STM [(Text, Text)]
+getRecentFailures archVar fp = do
+  entries <- readTVar archVar
+  let fpText = T.pack fp
+      failures = [ (entryCode e, reason)
+                 | e <- entries
+                 , not (entryPassed e)
+                 , case entryMutation e of
+                     Just mut -> mutationTarget mut == fpText
+                     Nothing  -> False
+                 , Just reason <- [entryFailureReason e]
+                 ]
+  pure (take 3 failures)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Statistics
@@ -201,6 +222,9 @@ openArchive InMemory = pure ArchiveHandle
 openArchive (SQLiteBacked path) = do
   conn <- SQL.open path
   SQL.execute_ conn sqlCreateTable
+  -- Migration: add failure_reason column if it doesn't exist.
+  _ <- try (SQL.execute_ conn "ALTER TABLE archive_entries ADD COLUMN failure_reason TEXT")
+         :: IO (Either SomeException ())
   SQL.execute_ conn sqlCreateBlacklistTable
   SQL.execute_ conn sqlCreateDynamicRulesTable
   pure ArchiveHandle
@@ -270,7 +294,7 @@ sqlFlush conn entries = SQL.withTransaction conn $
 
 sqlUpsert :: SQL.Connection -> ArchiveEntry -> IO ()
 sqlUpsert conn e = SQL.execute conn
-  "INSERT OR REPLACE INTO archive_entries (id, code, parent_id, score, passed, generation, counter_ex) VALUES (?,?,?,?,?,?,?)"
+  "INSERT OR REPLACE INTO archive_entries (id, code, parent_id, score, passed, generation, counter_ex, failure_reason) VALUES (?,?,?,?,?,?,?,?)"
   ( entryId e
   , entryCode e
   , entryParentId e
@@ -278,17 +302,18 @@ sqlUpsert conn e = SQL.execute conn
   , (if entryPassed e then 1 else 0 :: Int)
   , entryGeneration e
   , fmap (TE.decodeUtf8 . BL.toStrict . Aeson.encode) (entryCounterEx e)
+  , entryFailureReason e
   )
 
 -- | Load all rows from the archive table.
 sqlLoad :: SQL.Connection -> IO [ArchiveEntry]
 sqlLoad conn = do
   rows <- SQL.query_ conn
-    "SELECT id, code, parent_id, score, passed, generation, counter_ex FROM archive_entries"
+    "SELECT id, code, parent_id, score, passed, generation, counter_ex, failure_reason FROM archive_entries"
   pure (map rowToEntry rows)
   where
-    rowToEntry :: (Text, Text, Maybe Text, Double, Int, Int, Maybe Text) -> ArchiveEntry
-    rowToEntry (eid, code, parentId, score, passed, gen, cex) = ArchiveEntry
+    rowToEntry :: (Text, Text, Maybe Text, Double, Int, Int, Maybe Text, Maybe Text) -> ArchiveEntry
+    rowToEntry (eid, code, parentId, score, passed, gen, cex, failReason) = ArchiveEntry
       { entryId         = eid
       , entryCode       = code
       , entryMutation   = Nothing
@@ -300,6 +325,7 @@ sqlLoad conn = do
       , entryLiquidResult = Nothing
       , entrySbvResult    = Nothing
       , entryOracleModel  = Nothing
+      , entryFailureReason = failReason
       }
 
 sqlCreateBlacklistTable :: SQL.Query

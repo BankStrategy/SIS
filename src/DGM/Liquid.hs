@@ -19,6 +19,9 @@ module DGM.Liquid
   , verifyWithLiquid
     -- * Output parsing
   , parseLiquidOutput
+    -- * Annotation detection
+  , hasLiquidAnnotations
+  , countLiquidAnnotations
   ) where
 
 import Data.Text (Text)
@@ -140,3 +143,26 @@ parseLiquidOutput output
         []    -> LiquidError (T.take 200 (T.pack output))
   where
     linesT = map T.pack (lines output)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Annotation detection
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | True when the source text contains at least one LiquidHaskell annotation.
+--
+-- Detects @{-\@ ... \@-}@ refinement type annotations.  Used to decide
+-- whether LH verification should be upgraded from "pass-through" to "real"
+-- checking on the mutated source.
+hasLiquidAnnotations :: Text -> Bool
+hasLiquidAnnotations = T.isInfixOf "{-@"
+
+-- | Count the number of LiquidHaskell annotations in source text.
+--
+-- Returns the number of @{-\@@  occurrences.  Useful for detecting whether
+-- a mutation ADDED annotations (compare count before vs after).
+countLiquidAnnotations :: Text -> Int
+countLiquidAnnotations src = go src 0
+  where
+    go t n = case T.breakOn "{-@" t of
+      (_, rest) | T.null rest -> n
+      (_, rest) -> go (T.drop 3 rest) (n + 1)

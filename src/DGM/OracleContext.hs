@@ -20,6 +20,8 @@ module DGM.OracleContext
   , buildModuleContext
     -- * Enriched prompt (pure)
   , buildEnrichedPrompt
+    -- * Semantic prompt (engineer-grade)
+  , buildSemanticPrompt
   ) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, tryPutMVar, takeMVar, threadDelay)
@@ -33,6 +35,7 @@ import System.Process (createProcess, proc, std_out, std_err, StdStream(..), wai
 
 import DGM.ModGraph (ModuleGraph(..), extractExports)
 import DGM.Oracle (MutationContext)
+import DGM.SemanticContext (SemanticContext(..), FunctionInfo(..), TestMapping(..))
 import qualified Data.Map.Strict as Map
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +260,84 @@ buildEnrichedPrompt ctx _mCtx
       if null (mcReverseDeps ctx)
         then []
         else ["- Used by: " <> T.intercalate ", " (mcReverseDeps ctx)]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Semantic prompt (engineer-grade)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Build an engineer-grade semantic prompt from a 'SemanticContext'.
+--
+-- Formats type signatures, complexity metrics, test coverage status,
+-- cross-module usage, and past failure history into a structured prompt
+-- that enables the Oracle to propose algorithmic improvements rather than
+-- just lint fixes.
+--
+-- Returns 'Nothing' when the context has no functions (e.g. a Types-only module).
+buildSemanticPrompt :: SemanticContext -> Maybe MutationContext -> Maybe Text
+buildSemanticPrompt sc _mCtx
+  | null (scFunctions sc) = Nothing
+  | otherwise = Just $ T.unlines $
+      [ "## MODULE: " <> T.pack (scFilePath sc)
+      , ""
+      , "### TYPE SIGNATURES"
+      ] ++ typeSigLines ++
+      [ ""
+      , "### FUNCTION COMPLEXITY (lines / complexity score)"
+      ] ++ complexityLines ++
+      [ ""
+      , "### TEST COVERAGE"
+      ] ++ coverageLines ++
+      crossModuleLines ++
+      failureLines ++
+      [ ""
+      , "### SOURCE"
+      , "---"
+      ] ++
+      -- We don't have the source text in SemanticContext, so output function summary
+      [ "Functions: " <> T.intercalate ", " (map fiName (scFunctions sc))
+      , "---"
+      ]
+  where
+    typeSigLines =
+      [ fiName f <> " " <> maybe "(no signature)" id (fiTypeSig f)
+      | f <- scFunctions sc
+      ]
+
+    complexityLines =
+      [ fiName f <> ": " <> T.pack (show (fiLineCount f)) <> " lines, complexity "
+                         <> T.pack (show (fiComplexity f))
+      | f <- scFunctions sc
+      ]
+
+    testedNames = map tmTestedFunc (scTestCoverage sc)
+
+    coverageLines =
+      [ fiName f <> ": " <>
+          (if fiName f `elem` testedNames
+           then "TESTED (" <> T.pack (show (countTests (fiName f))) <> " tests)"
+           else "NOT TESTED  <-- improvement target")
+      | f <- scFunctions sc
+      ]
+
+    countTests name = length [t | t <- scTestCoverage sc, tmTestedFunc t == name]
+
+    crossModuleLines =
+      if null (scUsedBy sc)
+      then []
+      else [ ""
+           , "### CROSS-MODULE USAGE"
+           ] ++ [ fst ub <> ": used by " <> T.intercalate ", " (snd ub)
+                | ub <- scUsedBy sc
+                ]
+
+    failureLines =
+      if null (scRecentFailures sc)
+      then []
+      else [ ""
+           , "### PAST FAILURES"
+           ] ++ [ "\"" <> desc <> "\" failed: " <> reason
+                | (desc, reason) <- scRecentFailures sc
+                ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Configuration

@@ -14,6 +14,9 @@ module DGM.SelfCompile
     -- * Scoring
   , scoreCompileResult
   , enrichScore
+  , enrichScoreV2
+    -- * Test detail parsing
+  , parseTestDetails
     -- * Transactional rollback
   , SelfModTxn(..)
   , withSelfModTxn
@@ -50,9 +53,10 @@ data CompilePhase
 -- | Result of a @cabal build@ or @cabal test@ invocation.
 data CompileResult
   = CompileSuccess
-      { crTestsPassed :: Int
-      , crTestsFailed :: Int
-      , crLatencyMs   :: Double
+      { crTestsPassed  :: Int
+      , crTestsFailed  :: Int
+      , crLatencyMs    :: Double
+      , crFailedTests  :: [Text]    -- ^ Names of individual tests that failed.
       }
   | CompileFailure
       { crErrors :: Text
@@ -102,7 +106,7 @@ buildPreflight = do
 -- * 'CompileFailure' 'ParsePhase'        → 0.0
 -- * 'CompileFailure' other               → 0.05
 scoreCompileResult :: CompileResult -> Double
-scoreCompileResult (CompileSuccess passed failed _lat)
+scoreCompileResult (CompileSuccess passed failed _lat _failedTests)
   | total  == 0 = 0.0
   | failed == 0 = 1.0
   | otherwise   = fromIntegral passed / fromIntegral total
@@ -139,6 +143,77 @@ enrichScore base origLen mutLen mLhResult =
                     Just txt | "SAFE" `T.isInfixOf` txt -> 0.02
                     _                                    -> 0.0
   in  min 1.0 (base + sizeBonus + lhBonus)
+
+-- | Enrich a base score with additional fitness signals (v2).
+--
+-- Extends 'enrichScore' with:
+--
+--   * __Complexity reduction bonus__: mutations that reduce cyclomatic complexity
+--     receive a bonus proportional to the reduction.
+--
+--   * __Novelty bonus__: mutations of a category not previously seen for this
+--     file receive a small bonus to encourage exploration.
+--
+-- The result is capped at 1.0.
+enrichScoreV2
+  :: Double       -- ^ Base score from 'scoreCompileResult'.
+  -> Int          -- ^ Original source length in characters.
+  -> Int          -- ^ Mutated source length in characters.
+  -> Maybe Text   -- ^ LiquidHaskell result text.
+  -> Maybe Int    -- ^ Complexity delta (negative = improvement).
+  -> Bool         -- ^ Novel category for this file?
+  -> Double
+enrichScoreV2 base origLen mutLen mLhResult mComplexityDelta isNovel =
+  let shrinkRatio = if origLen <= 0
+                      then 0.0
+                      else fromIntegral (max 0 (origLen - mutLen))
+                           / fromIntegral origLen
+      sizeBonus = 0.05 * shrinkRatio
+      lhBonus   = case mLhResult of
+                    Just txt | "SAFE" `T.isInfixOf` txt -> 0.02
+                    _                                    -> 0.0
+      complexityBonus = case mComplexityDelta of
+                          Nothing    -> 0.0
+                          Just delta -> 0.03 * fromIntegral (max 0 (negate delta))
+                                            / 10.0  -- normalise against max complexity
+      noveltyBonus = if isNovel then 0.01 else 0.0
+  in  min 1.0 (base + sizeBonus + lhBonus + complexityBonus + noveltyBonus)
+
+-- | Parse individual test results from tasty's @--test-show-details=direct@ output.
+--
+-- Returns a list of @(testName, passed)@ pairs.
+--
+-- Recognises tasty output patterns:
+--
+-- >     buildModuleGraph returns valid graph:    OK
+-- >     moduleImpact scores correctly:           FAIL
+parseTestDetails :: String -> [(Text, Bool)]
+parseTestDetails output = concatMap parseLine (lines output)
+  where
+    parseLine ln =
+      let t = T.pack ln
+          stripped = T.strip t
+      in if T.isSuffixOf "OK" stripped
+         then [(extractTestName stripped, True)]
+         else if T.isSuffixOf "FAIL" stripped
+              || T.isInfixOf "FAIL" stripped
+         then [(extractTestName stripped, False)]
+         else []
+
+    extractTestName s =
+      -- Strip trailing "OK", "FAIL", or ": FAIL ..." and surrounding whitespace/colons
+      let s1 = T.strip s
+          -- Remove trailing status
+          s2 = if T.isSuffixOf "OK" s1
+               then T.strip (T.dropEnd 2 s1)
+               else if T.isSuffixOf "FAIL" s1
+               then T.strip (T.dropEnd 4 s1)
+               else s1
+          -- Remove trailing colon if present
+          s3 = if T.isSuffixOf ":" s2
+               then T.strip (T.dropEnd 1 s2)
+               else s2
+      in s3
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Transactional rollback
@@ -206,7 +281,8 @@ parseResult Nothing combined _lat =
   CompileFailure (T.pack ("Timeout\n" <> combined)) TestPhase
 parseResult (Just ExitSuccess) combined lat =
   let (passed, failed) = parseTestCounts combined
-  in  CompileSuccess passed failed lat
+      failedNames = [name | (name, False) <- parseTestDetails combined]
+  in  CompileSuccess passed failed lat failedNames
 parseResult (Just (ExitFailure _)) combined _lat =
   CompileFailure (T.pack combined) (classifyFailure (T.pack combined))
 

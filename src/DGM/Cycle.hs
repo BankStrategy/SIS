@@ -24,6 +24,8 @@ module DGM.Cycle
     -- * Step-level observations
   , CycleStep(..)
   , StepResult(..)
+    -- * Multi-file change set pipeline
+  , runChangeSetPipeline
     -- * Generation model helpers
   , hasSuccessfulCommit
   ) where
@@ -40,7 +42,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import System.Exit (ExitCode)
+import System.Exit (ExitCode(..))
 import System.IO (hFlush, stdout)
 import qualified System.IO
 import qualified System.Process
@@ -63,7 +65,7 @@ import DGM.HsAST (HsMutation(..), HsModule, applyHsMutation, printHsModule)
 import DGM.SelfMod (discoverSources, proposeSelfMutations, rankMutations, writeMutation, commitMutation)
 import DGM.Liquid (verifyWithLiquid, LiquidResult(..))
 import DGM.SelfCompile
-  ( testSelf, scoreCompileResult, enrichScore, buildPreflight
+  ( CompileResult(..), testSelf, scoreCompileResult, enrichScore, buildPreflight
   , SelfModTxn(..), withSelfModTxn
   )
 import DGM.ModGraph (buildModuleGraph, removesExportedName)
@@ -368,6 +370,7 @@ tryCandidate cfg st step1 step2 oracleModel srcs ((fp, mut, origModule) : rest) 
                     <> "): " <> applyErr)
       emit cfg step3
       archiveSelfModFailed cfg (hmDescription mut) fp 0.0 Nothing Nothing oracleModel
+        (Just ("Mutation inapplicable: " <> applyErr))
       -- Blacklist inapplicable mutation so it is not re-proposed.
       atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
         (Set.insert (fp, hmDescription mut))
@@ -484,6 +487,7 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
       let step5 = step5Desc False ("Score: " <> T.pack (show score))
       emit cfg step5
       archiveSelfModFailed cfg (hmDescription mut) fp score mLhText mSbvText oracleModel
+        (Just (T.take 500 err))
       -- Blacklist this (file, mutation) pair so it is not re-proposed.
       atomically $ modifyTVar' (stateMutationBlacklist (ccAgentState cfg))
         (Set.insert (fp, hmDescription mut))
@@ -504,7 +508,7 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
       emit cfg step5
       -- Create archive entry with full provenance.
       gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
-      entry <- mkSelfModEntry gen (hmDescription mut) fp score True mLhText mSbvText oracleModel
+      entry <- mkSelfModEntry gen (hmDescription mut) fp score True mLhText mSbvText oracleModel Nothing
       -- Commit the mutation to git.
       commitResult <- commitMutation fp mut entry
       let step6 = case commitResult of
@@ -524,6 +528,112 @@ runMutationPipeline cfg st step1 step2 oracleModel srcs fp mut _origModule mutMo
       -- ── Hint sub-step: propose + evaluate dynamic rule ─────────────────
       hintSteps <- runHintSubStep cfg
       pure ([step1, step2, step3, step4, step4b, step5, step6] ++ hintSteps)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Multi-file change set pipeline
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Atomically apply a coordinated change set across multiple files.
+--
+-- 1. Snapshot all target files.
+-- 2. Write all mutations.
+-- 3. Run a single 'buildPreflight' + 'testSelf'.
+-- 4. Success → single git commit for all files; Failure → rollback all.
+--
+-- Returns @Right commitHash@ on success, @Left err@ on failure (after rollback).
+runChangeSetPipeline
+  :: CycleConfig
+  -> [(FilePath, HsMutation, HsModule)]  -- ^ (path, mutation, mutatedModule)
+  -> IO (Either Text Text)
+runChangeSetPipeline cfg changes = do
+  let st = ccAgentState cfg
+  -- 1. Snapshot all original files
+  snapshots <- mapM (\(fp, _, _) -> do
+    orig <- TIO.readFile fp
+    return (fp, orig)) changes
+
+  -- 2. Write all mutations
+  nowPosix <- getPOSIXTime
+  let now = floor nowPosix :: Int64
+  writeResults <- mapM (\(fp, _mut, mutModule) -> do
+    let opName = "changeset-write:" <> T.pack fp
+        proof  = mockQuorumProof opName now
+    wr <- writeMutation st (ccAuditLog cfg) proof fp mutModule
+    return (fp, wr)) changes
+
+  let writeErrors = [(fp, e) | (fp, Left e) <- writeResults]
+  if not (null writeErrors)
+    then do
+      -- Rollback: restore all snapshots
+      mapM_ (\(fp, orig) -> TIO.writeFile fp orig) snapshots
+      let errMsg = T.intercalate "; " [T.pack fp <> ": " <> e | (fp, e) <- writeErrors]
+      return (Left ("ChangeSet write failed: " <> errMsg))
+    else do
+      -- 3. Build pre-flight + test
+      preflight <- buildPreflight
+      case preflight of
+        Left buildErr -> do
+          -- Rollback
+          mapM_ (\(fp, orig) -> TIO.writeFile fp orig) snapshots
+          return (Left ("ChangeSet build pre-flight: " <> buildErr))
+        Right () -> do
+          cr <- testSelf
+          let score = scoreCompileResult cr
+          if score >= 1.0
+            then do
+              -- 4. Success → commit all files
+              gen <- atomically (readTVar (stateGeneration st))
+              let desc = T.intercalate ", " [hmDescription m | (_, m, _) <- changes]
+                  fps  = [fp | (fp, _, _) <- changes]
+              entry <- mkSelfModEntry gen ("changeset: " <> T.take 60 desc)
+                         (head fps) score True Nothing Nothing Nothing Nothing
+              -- Stage all changed files and commit
+              commitResult <- commitChangeSet fps desc entry
+              case commitResult of
+                Right gitHash -> do
+                  atomically $ addEntry (stateArchive st) entry
+                  flushArchive (ccArchiveHandle cfg) [entry]
+                  atomically $ modifyTVar' (stateGeneration st) (+1)
+                  return (Right gitHash)
+                Left commitErr -> return (Left commitErr)
+            else do
+              -- Rollback
+              mapM_ (\(fp, orig) -> TIO.writeFile fp orig) snapshots
+              return (Left ("ChangeSet tests degraded, score=" <> T.pack (show score)))
+
+-- | Commit multiple files as a single git commit.
+commitChangeSet :: [FilePath] -> Text -> ArchiveEntry -> IO (Either Text Text)
+commitChangeSet [] _ _ = return (Left "commitChangeSet: no files to commit")
+commitChangeSet fps desc entry = do
+  -- Find git root
+  (sc0, rootOut, _) <- System.Process.readProcessWithExitCode
+    "git" ["rev-parse", "--show-toplevel"] ""
+  case sc0 of
+    ExitFailure _ -> return (Left "commitChangeSet: not in a git repository")
+    ExitSuccess -> do
+      let gitRoot = T.unpack (T.strip (T.pack rootOut))
+      -- Stage all files
+      addResults <- mapM (\fp -> do
+        (ec, _, err) <- System.Process.readProcessWithExitCode
+          "git" ["-C", gitRoot, "add", fp] ""
+        return (ec, err)) fps
+      let addErrors = [err | (ExitFailure _, err) <- addResults]
+      if not (null addErrors)
+        then return (Left ("git add failed: " <> T.pack (unlines addErrors)))
+        else do
+          let msg = "selfmod: changeset " <> T.take 50 desc
+                 <> " (gen " <> T.pack (show (entryGeneration entry)) <> ")"
+                 <> " [entry:" <> entryId entry <> "]"
+          (cc, _, commitErr) <- System.Process.readProcessWithExitCode
+            "git" ["-C", gitRoot, "commit", "-m", T.unpack msg] ""
+          case cc of
+            ExitFailure _ -> return (Left ("git commit failed: " <> T.pack commitErr))
+            ExitSuccess -> do
+              (ec, hashOut, _) <- System.Process.readProcessWithExitCode
+                "git" ["-C", gitRoot, "rev-parse", "HEAD"] ""
+              case ec of
+                ExitSuccess   -> return (Right (T.strip (T.pack hashOut)))
+                ExitFailure _ -> return (Left "git rev-parse HEAD failed")
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Hint sub-step: propose + evaluate + test + commit/reject dynamic rule
@@ -604,7 +714,7 @@ runHintSubStep cfg = do
         else do
           -- ── Stage 4b: Reject — archive as failed (stepping-stone) ───────
           archiveSelfModFailed cfg ("hint-reject: " <> drDescription newRule)
-                               "" 0.0 Nothing Nothing Nothing
+                               "" 0.0 Nothing Nothing Nothing Nothing
           let stepReject = StepResult StepPersist False
                              "HintReject: rule archived as stepping-stone"
           emit cfg stepReject
@@ -685,15 +795,15 @@ archiveSuccess cfg result = do
   atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
   flushArchive (ccArchiveHandle cfg) [entry]
 
-archiveSelfModFailed :: CycleConfig -> Text -> FilePath -> Double -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
-archiveSelfModFailed cfg desc fp score mLh mSbv mOracle = do
+archiveSelfModFailed :: CycleConfig -> Text -> FilePath -> Double -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
+archiveSelfModFailed cfg desc fp score mLh mSbv mOracle mFailure = do
   gen <- atomically (readTVar (stateGeneration (ccAgentState cfg)))
-  entry <- mkSelfModEntry gen desc fp score False mLh mSbv mOracle
+  entry <- mkSelfModEntry gen desc fp score False mLh mSbv mOracle mFailure
   atomically $ addEntry (stateArchive (ccAgentState cfg)) entry
   flushArchive (ccArchiveHandle cfg) [entry]
 
-mkSelfModEntry :: Int -> Text -> FilePath -> Double -> Bool -> Maybe Text -> Maybe Text -> Maybe Text -> IO ArchiveEntry
-mkSelfModEntry gen desc fp score passed mLh mSbv mOracle = do
+mkSelfModEntry :: Int -> Text -> FilePath -> Double -> Bool -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> IO ArchiveEntry
+mkSelfModEntry gen desc fp score passed mLh mSbv mOracle mFailure = do
   n <- randomRIO (0 :: Int, maxBound)
   let eid = "selfmod-" <> T.pack (show n)
       mut = Mutation
@@ -713,6 +823,7 @@ mkSelfModEntry gen desc fp score passed mLh mSbv mOracle = do
     , entryLiquidResult = mLh
     , entrySbvResult    = mSbv
     , entryOracleModel  = mOracle
+    , entryFailureReason = mFailure
     }
 
 -- ─────────────────────────────────────────────────────────────────────────────

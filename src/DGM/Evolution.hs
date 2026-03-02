@@ -257,6 +257,7 @@ mkArchiveEntry gen result = do
     , entryLiquidResult = Nothing
     , entrySbvResult    = Nothing
     , entryOracleModel  = Nothing
+    , entryFailureReason = Nothing
     }
 
 -- | Generate a simple unique ID (UUID-lite).

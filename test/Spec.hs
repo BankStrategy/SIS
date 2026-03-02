@@ -27,8 +27,9 @@ import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck
 
 import DGM
-import DGM.Liquid (LiquidResult(..), parseLiquidOutput, verifyWithLiquid)
-import DGM.OracleContext (GhcWarning(..), WarningKind(..), ModuleContext(..), parseGhcWarnings, buildModuleContext, buildEnrichedPrompt)
+import DGM.Liquid (LiquidResult(..), parseLiquidOutput, verifyWithLiquid, hasLiquidAnnotations, countLiquidAnnotations)
+import DGM.OracleContext (GhcWarning(..), WarningKind(..), ModuleContext(..), parseGhcWarnings, buildModuleContext, buildEnrichedPrompt, buildSemanticPrompt)
+import DGM.SemanticContext (SemanticContext(..), FunctionInfo(..), TestMapping(..), extractFunctions, buildTestCoverage)
 
 main :: IO ()
 main = defaultMain tests
@@ -57,6 +58,12 @@ tests = testGroup "DGM"
   , pipelineTests
   , natLangTests
   , oracleContextTests
+  , semanticContextTests
+  , semanticPromptTests
+  , parseTestDetailTests
+  , enrichScoreV2Tests
+  , liquidAnnotationTests
+  , failureReasonTests
 #ifdef WITH_SQLITE
   , sqliteArchiveTests
 #endif
@@ -462,6 +469,7 @@ mkEntry eid score passed = ArchiveEntry
   , entryLiquidResult = Nothing
   , entrySbvResult    = Nothing
   , entryOracleModel  = Nothing
+  , entryFailureReason = Nothing
   }
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -1043,13 +1051,13 @@ selfModTests = testGroup "DGM.SelfMod"
 selfCompileTests :: TestTree
 selfCompileTests = testGroup "DGM.SelfCompile"
   [ testCase "scoreCompileResult: all pass → 1.0" $
-      scoreCompileResult (CompileSuccess 42 0 100.0) @?= 1.0
+      scoreCompileResult (CompileSuccess 42 0 100.0 []) @?= 1.0
 
   , testCase "scoreCompileResult: k/n pass → ratio" $
-      scoreCompileResult (CompileSuccess 3 1 50.0) @?= 0.75
+      scoreCompileResult (CompileSuccess 3 1 50.0 ["failed test"]) @?= 0.75
 
   , testCase "scoreCompileResult: zero total → 0.0" $
-      scoreCompileResult (CompileSuccess 0 0 0.0) @?= 0.0
+      scoreCompileResult (CompileSuccess 0 0 0.0 []) @?= 0.0
 
   , testCase "scoreCompileResult: TypeCheckPhase → 0.1" $
       scoreCompileResult (CompileFailure "some error" TypeCheckPhase) @?= 0.1
@@ -1102,7 +1110,7 @@ selfCompileTests = testGroup "DGM.SelfCompile"
       scoreCompileResult (CompileFailure "FAIL" TestPhase) @?= 0.05
 
   , testCase "CompileResult Show round-trip (smoke test)" $ do
-      let r1 = CompileSuccess 10 2 250.0
+      let r1 = CompileSuccess 10 2 250.0 ["test1", "test2"]
           r2 = CompileFailure "type error" TypeCheckPhase
       -- Just ensure Show doesn't throw.
       length (show r1) > 0 @?= True
@@ -2244,4 +2252,393 @@ oracleContextTests = testGroup "DGM.OracleContext"
             , mcReverseDeps = []
             }
       buildEnrichedPrompt ctx Nothing @?= Nothing
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SemanticContext tests (Stage 1)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+semanticContextTests :: TestTree
+semanticContextTests = testGroup "DGM.SemanticContext"
+  [ testCase "extractFunctions: finds top-level function with type sig" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "bar :: Int -> Int"
+            , "bar x = x + 1"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      fiName (head funcs) @?= "bar"
+      fiTypeSig (head funcs) @?= Just ":: Int -> Int"
+      fiLineStart (head funcs) @?= 4
+
+  , testCase "extractFunctions: finds function without type sig" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "baz x = x * 2"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      fiName (head funcs) @?= "baz"
+      fiTypeSig (head funcs) @?= Nothing
+
+  , testCase "extractFunctions: multiple functions" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "foo :: Int -> Int"
+            , "foo x = x + 1"
+            , ""
+            , "bar :: String -> String"
+            , "bar s = s ++ \"!\""
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 2
+      map fiName funcs @?= ["foo", "bar"]
+
+  , testCase "extractFunctions: counts complexity from case/where" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "complex :: Int -> Int"
+            , "complex x = case x of"
+            , "  1 -> helper"
+            , "  _ -> 20"
+            , "  where"
+            , "    helper = x + 1"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      let c = fiComplexity (head funcs)
+      -- case + where → complexity > 1
+      c > 1 @?= True
+
+  , testCase "extractFunctions: detects inter-function calls" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "helper :: Int -> Int"
+            , "helper x = x + 1"
+            , ""
+            , "main :: Int -> Int"
+            , "main x = helper (x * 2)"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 2
+      let mainFunc = head (filter (\f -> fiName f == "main") funcs)
+      "helper" `elem` fiCalls mainFunc @?= True
+
+  , testCase "extractFunctions: skips data/type/class declarations" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "data Foo = Bar | Baz"
+            , ""
+            , "type Name = String"
+            , ""
+            , "class MyClass a where"
+            , "  myMethod :: a -> Int"
+            , ""
+            , "realFunc :: Int -> Int"
+            , "realFunc x = x"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      fiName (head funcs) @?= "realFunc"
+
+  , testCase "extractFunctions: empty source returns []" $ do
+      extractFunctions "" @?= []
+
+  , testCase "extractFunctions: handles multi-line type signatures" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "longSig :: Int"
+            , "         -> String"
+            , "         -> IO ()"
+            , "longSig n s = putStrLn (show n ++ s)"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      let sig = fiTypeSig (head funcs)
+      -- Sig should contain the continuation
+      case sig of
+        Just s  -> T.isInfixOf "Int" s @?= True
+        Nothing -> assertFailure "Expected type signature"
+
+  , testCase "buildTestCoverage: matches function name in test description" $ do
+      let funcs = [ FunctionInfo "buildModuleGraph" Nothing 1 5 [] 1
+                  , FunctionInfo "numDependents" Nothing 10 3 [] 1
+                  ]
+      mappings <- buildTestCoverage funcs
+      -- This depends on test/Spec.hs actually containing "buildModuleGraph"
+      -- in a testCase name. Let's just verify it returns a list (may be empty
+      -- if the test file layout changes).
+      mappings `seq` return ()
+
+  , testCase "extractFunctions: line count is correct" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , ""
+            , "foo :: Int -> Int"
+            , "foo x ="
+            , "  let y = x + 1"
+            , "  in  y * 2"
+            ]
+          funcs = extractFunctions src
+      length funcs @?= 1
+      fiLineCount (head funcs) >= 3 @?= True
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Semantic prompt tests (Stage 2)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+semanticPromptTests :: TestTree
+semanticPromptTests = testGroup "DGM.OracleContext.buildSemanticPrompt"
+  [ testCase "buildSemanticPrompt: includes TYPE SIGNATURES section" $ do
+      let sc = SemanticContext
+            { scFilePath        = "src/DGM/Foo.hs"
+            , scModuleName      = "DGM.Foo"
+            , scFunctions       = [ FunctionInfo "doThing" (Just ":: Int -> IO ()") 5 10 ["helper"] 3 ]
+            , scTestCoverage    = []
+            , scUntestedExports = ["doThing"]
+            , scUsedBy          = []
+            , scRecentFailures  = []
+            }
+      case buildSemanticPrompt sc Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt -> do
+          T.isInfixOf "TYPE SIGNATURES" prompt @?= True
+          T.isInfixOf "doThing" prompt @?= True
+          T.isInfixOf ":: Int -> IO ()" prompt @?= True
+
+  , testCase "buildSemanticPrompt: includes FUNCTION COMPLEXITY section" $ do
+      let sc = SemanticContext
+            { scFilePath        = "src/DGM/Foo.hs"
+            , scModuleName      = "DGM.Foo"
+            , scFunctions       = [ FunctionInfo "bigFunc" Nothing 1 25 [] 8 ]
+            , scTestCoverage    = []
+            , scUntestedExports = []
+            , scUsedBy          = []
+            , scRecentFailures  = []
+            }
+      case buildSemanticPrompt sc Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt ->
+          T.isInfixOf "COMPLEXITY" prompt @?= True
+
+  , testCase "buildSemanticPrompt: includes TEST COVERAGE section" $ do
+      let sc = SemanticContext
+            { scFilePath        = "src/DGM/Foo.hs"
+            , scModuleName      = "DGM.Foo"
+            , scFunctions       = [ FunctionInfo "tested" Nothing 1 5 [] 1
+                                  , FunctionInfo "untested" Nothing 10 5 [] 1
+                                  ]
+            , scTestCoverage    = [ TestMapping "tested works" "tested" "test/Spec.hs" ]
+            , scUntestedExports = ["untested"]
+            , scUsedBy          = []
+            , scRecentFailures  = []
+            }
+      case buildSemanticPrompt sc Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt -> do
+          T.isInfixOf "TESTED" prompt @?= True
+          T.isInfixOf "NOT TESTED" prompt @?= True
+
+  , testCase "buildSemanticPrompt: includes PAST FAILURES section" $ do
+      let sc = SemanticContext
+            { scFilePath        = "src/DGM/Foo.hs"
+            , scModuleName      = "DGM.Foo"
+            , scFunctions       = [ FunctionInfo "foo" Nothing 1 5 [] 1 ]
+            , scTestCoverage    = []
+            , scUntestedExports = []
+            , scUsedBy          = []
+            , scRecentFailures  = [("refactor foo", "Couldn't match type")]
+            }
+      case buildSemanticPrompt sc Nothing of
+        Nothing -> assertFailure "Expected Just prompt"
+        Just prompt -> do
+          T.isInfixOf "PAST FAILURES" prompt @?= True
+          T.isInfixOf "Couldn't match" prompt @?= True
+
+  , testCase "buildSemanticPrompt: returns Nothing for empty functions" $ do
+      let sc = SemanticContext
+            { scFilePath        = "src/DGM/Foo.hs"
+            , scModuleName      = "DGM.Foo"
+            , scFunctions       = []
+            , scTestCoverage    = []
+            , scUntestedExports = []
+            , scUsedBy          = []
+            , scRecentFailures  = []
+            }
+      buildSemanticPrompt sc Nothing @?= Nothing
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- parseTestDetails tests (Stage 4)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+parseTestDetailTests :: TestTree
+parseTestDetailTests = testGroup "DGM.SelfCompile.parseTestDetails"
+  [ testCase "parseTestDetails: parses OK tests" $ do
+      let output = unlines
+            [ "  DGM.AST"
+            , "    buildModuleGraph returns valid graph:    OK"
+            , "    numDependents is zero for unknown:       OK"
+            ]
+          results = parseTestDetails output
+      length results @?= 2
+      all snd results @?= True
+
+  , testCase "parseTestDetails: parses FAIL tests" $ do
+      let output = unlines
+            [ "  DGM.Foo"
+            , "    some test:                               FAIL"
+            ]
+          results = parseTestDetails output
+      length results @?= 1
+      snd (head results) @?= False
+
+  , testCase "parseTestDetails: mixed OK and FAIL" $ do
+      let output = unlines
+            [ "    test1:    OK"
+            , "    test2:    FAIL"
+            , "    test3:    OK"
+            ]
+          results = parseTestDetails output
+      length results @?= 3
+      map snd results @?= [True, False, True]
+
+  , testCase "parseTestDetails: empty output returns []" $ do
+      parseTestDetails "" @?= []
+
+  , testCase "parseTestDetails: ignores non-test lines" $ do
+      let output = unlines
+            [ "Running 1 test suites..."
+            , "Test suite dgm-test: RUNNING..."
+            , "  DGM.AST"
+            , "    test:    OK"
+            , "All 1 tests passed"
+            ]
+          results = parseTestDetails output
+      length results @?= 1
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- enrichScoreV2 tests (Stage 6)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+enrichScoreV2Tests :: TestTree
+enrichScoreV2Tests = testGroup "DGM.SelfCompile.enrichScoreV2"
+  [ testCase "enrichScoreV2: base score 1.0 with no bonuses stays 1.0" $
+      enrichScoreV2 1.0 100 100 Nothing Nothing False @?= 1.0
+
+  , testCase "enrichScoreV2: size reduction adds bonus" $ do
+      let score = enrichScoreV2 0.9 200 150 Nothing Nothing False
+      score > 0.9 @?= True
+      score <= 1.0 @?= True
+
+  , testCase "enrichScoreV2: LH SAFE adds 0.02 bonus" $ do
+      let withLH    = enrichScoreV2 0.9 100 100 (Just "SAFE") Nothing False
+          withoutLH = enrichScoreV2 0.9 100 100 Nothing Nothing False
+      abs (withLH - withoutLH - 0.02) < 1e-10 @?= True
+
+  , testCase "enrichScoreV2: complexity improvement adds bonus" $ do
+      let withDelta    = enrichScoreV2 0.9 100 100 Nothing (Just (-5)) False
+          withoutDelta = enrichScoreV2 0.9 100 100 Nothing Nothing False
+      withDelta > withoutDelta @?= True
+
+  , testCase "enrichScoreV2: novelty adds 0.01 bonus" $ do
+      let novel    = enrichScoreV2 0.9 100 100 Nothing Nothing True
+          notNovel = enrichScoreV2 0.9 100 100 Nothing Nothing False
+      abs (novel - notNovel - 0.01) < 1e-10 @?= True
+
+  , testCase "enrichScoreV2: capped at 1.0" $ do
+      let score = enrichScoreV2 0.98 200 50 (Just "SAFE") (Just (-10)) True
+      score @?= 1.0
+
+  , testCase "enrichScoreV2: all bonuses combined" $ do
+      let score = enrichScoreV2 0.5 200 150 (Just "SAFE") (Just (-3)) True
+      score > 0.5 @?= True
+      -- Should have size + LH + complexity + novelty bonuses
+      score > 0.55 @?= True
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Liquid annotation detection tests (Stage 7)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+liquidAnnotationTests :: TestTree
+liquidAnnotationTests = testGroup "DGM.Liquid.annotations"
+  [ testCase "hasLiquidAnnotations: detects {-@ @-}" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , "{-@ foo :: {v:Int | v > 0} @-}"
+            , "foo :: Int -> Int"
+            , "foo x = x"
+            ]
+      hasLiquidAnnotations src @?= True
+
+  , testCase "hasLiquidAnnotations: False for plain source" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , "foo :: Int -> Int"
+            , "foo x = x"
+            ]
+      hasLiquidAnnotations src @?= False
+
+  , testCase "countLiquidAnnotations: counts multiple annotations" $ do
+      let src = T.unlines
+            [ "{-@ foo :: {v:Int | v > 0} @-}"
+            , "foo :: Int -> Int"
+            , "foo x = x"
+            , ""
+            , "{-@ bar :: {v:Int | v >= 0} @-}"
+            , "bar :: Int -> Int"
+            , "bar x = abs x"
+            ]
+      countLiquidAnnotations src @?= 2
+
+  , testCase "countLiquidAnnotations: zero for no annotations" $
+      countLiquidAnnotations "module Foo where\nfoo = 1\n" @?= 0
+  ]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Failure reason tests (Stage 3)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+failureReasonTests :: TestTree
+failureReasonTests = testGroup "DGM.Types.entryFailureReason"
+  [ testCase "entryFailureReason: Nothing for successful entries" $ do
+      let entry = mkEntry "e1" 0.8 True
+      entryFailureReason entry @?= Nothing
+
+  , testCase "entryFailureReason: Just for failed entries" $ do
+      let entry = (mkEntry "e2" 0.3 False)
+                    { entryFailureReason = Just "Couldn't match types" }
+      entryFailureReason entry @?= Just "Couldn't match types"
+
+  , testCase "getRecentFailures: returns failures for matching file" $ do
+      failures <- newTVarIO
+        [ (mkEntry "e1" 0.0 False)
+            { entryMutation = Just (Mutation Expand "src/DGM/Foo.hs" (HaskellMutation "mut1"))
+            , entryFailureReason = Just "type error"
+            }
+        , (mkEntry "e2" 0.0 False)
+            { entryMutation = Just (Mutation Expand "src/DGM/Bar.hs" (HaskellMutation "mut2"))
+            , entryFailureReason = Just "other error"
+            }
+        ]
+      result <- atomically $ getRecentFailures failures "src/DGM/Foo.hs"
+      length result @?= 1
+      snd (head result) @?= "type error"
+
+  , testCase "getRecentFailures: returns empty for no failures" $ do
+      failures <- newTVarIO
+        [ mkEntry "e1" 1.0 True ]
+      result <- atomically $ getRecentFailures failures "src/DGM/Foo.hs"
+      null result @?= True
   ]

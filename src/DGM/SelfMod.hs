@@ -25,6 +25,8 @@ module DGM.SelfMod
     -- * Mutation pipeline
   , proposeSelfMutations
   , rankMutations
+    -- * Multi-file grouping
+  , groupRelatedModules
     -- * Writing
   , writeMutation
   , writeMutationTyped
@@ -51,10 +53,13 @@ import System.Process (readProcessWithExitCode)
 import DGM.Types
 import DGM.HsAST
 import DGM.SafetyKernel
-import DGM.ModGraph (ModuleGraph, moduleImpact)
+import DGM.ModGraph (ModuleGraph(..), moduleImpact)
+import qualified Data.Map.Strict as Map
 import DGM.Oracle (newOracleEnv, MutationContext)
-import DGM.OracleHandle (withOracle, proposeMutationH, proposeMutationEnrichedH)
-import DGM.OracleContext (GhcWarning, buildModuleContext, buildEnrichedPrompt)
+import DGM.OracleHandle (withOracle, proposeMutationH, proposeMutationEnrichedH, proposeMutationSemanticH)
+import DGM.OracleContext (GhcWarning, buildModuleContext, buildEnrichedPrompt, buildSemanticPrompt)
+import DGM.SemanticContext (buildSemanticContext)
+import DGM.Archive (getRecentFailures)
 import DGM.Reversal (Invertible(..), TypedTxn(..))
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -155,17 +160,35 @@ proposeSelfMutations st fps mCtx modGraph warnings = do
                     return []
                   Right om ->
                     return (filter notBlacklisted [(fp, om, m)])
-              -- No warnings for this file: fall back to standard prompt.
+              -- No warnings for this file: try semantic (engineer-grade) prompt.
               Nothing -> do
-                let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
-                eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
-                case eOrMut of
-                  Left err -> do
-                    unless ("build with -f+with-oracle" `T.isInfixOf` err) $
-                      hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
-                    return []
-                  Right om ->
-                    return (filter notBlacklisted [(fp, om, m)])
+                -- Build semantic context with failure history from archive.
+                recentFails <- atomically $ getRecentFailures (stateArchive st) fp
+                semCtx <- buildSemanticContext modGraph recentFails fp src
+                let mSemanticPrompt = buildSemanticPrompt semCtx mCtx
+                case mSemanticPrompt of
+                  -- Semantic context available: use engineer-grade prompt (tier 2).
+                  Just semanticPrompt -> do
+                    eOrMut <- withOracle env $ \h ->
+                      proposeMutationSemanticH h fp src semanticPrompt
+                    case eOrMut of
+                      Left err -> do
+                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                          hPutStrLn stderr ("DGM.SelfMod: oracle-semantic error for " ++ fp ++ ": " ++ T.unpack err)
+                        return []
+                      Right om ->
+                        return (filter notBlacklisted [(fp, om, m)])
+                  -- No functions found: fall back to standard prompt (tier 3).
+                  Nothing -> do
+                    let tests = map hnText (filter (\n -> hnKind n == "value") (hsNodes m))
+                    eOrMut <- withOracle env $ \h -> proposeMutationH h fp src tests mCtx
+                    case eOrMut of
+                      Left err -> do
+                        unless ("build with -f+with-oracle" `T.isInfixOf` err) $
+                          hPutStrLn stderr ("DGM.SelfMod: oracle error for " ++ fp ++ ": " ++ T.unpack err)
+                        return []
+                      Right om ->
+                        return (filter notBlacklisted [(fp, om, m)])
         return (oracleMuts ++ heuristicMuts)) fps
   return (concat perFile)
 
@@ -217,6 +240,56 @@ rankMutations mg triples = sortBy (comparing mkScore) triples
         sizeDiff = abs (mutLen - origLen)
 
         descIdx  = length (takeWhile (/= hmDescription mut) seenOrder)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Multi-file grouping
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- | Group source files into clusters of tightly-coupled modules.
+--
+-- Two modules are related when one imports the other (direct mutual
+-- dependency).  The transitive closure is capped at 3 modules per group
+-- to keep Oracle prompts manageable.
+--
+-- Files that have no cross-imports appear as singleton groups.
+groupRelatedModules :: ModuleGraph -> [FilePath] -> [[FilePath]]
+groupRelatedModules mg fps =
+  let -- Build path→moduleName lookup
+      pathToMod = Map.fromList [(fp, nm) | (nm, fp) <- Map.toList (mgModules mg)]
+      modToPath = mgModules mg
+
+      -- For each file, find modules it imports AND modules that import it
+      related fp =
+        case Map.lookup fp pathToMod of
+          Nothing -> []
+          Just nm ->
+            let imps  = maybe [] id (Map.lookup nm (mgImports mg))
+                users = maybe [] id (Map.lookup nm (mgUsedBy  mg))
+                peers = imps ++ users
+            in [ p | peer <- peers
+                   , Just p <- [Map.lookup peer modToPath]
+                   , p `elem` fps
+                   , p /= fp ]
+
+      -- Greedy grouping: walk files, merge into existing group if overlap
+      go [] groups = groups
+      go (f:fs) groups =
+        let peers = take 2 (related f)  -- cap at 2 peers → group size ≤ 3
+            -- Check if f or any peer is already in an existing group
+            (matching, others) = partition (any (`elem` (f : peers))) groups
+            merged = f : peers ++ concat matching
+            -- Deduplicate and cap at 3
+            capped = take 3 (nubOrd merged)
+        in  go fs (capped : others)
+
+      nubOrd xs = Set.toList (Set.fromList xs)
+
+  in  go fps []
+  where
+    partition _ [] = ([], [])
+    partition p (x:xs) =
+      let (yes, no) = partition p xs
+      in if p x then (x:yes, no) else (yes, x:no)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Writing

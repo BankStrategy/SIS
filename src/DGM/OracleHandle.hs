@@ -33,13 +33,15 @@ module DGM.OracleHandle
     -- * Handle-gated oracle operations
   , proposeMutationH
   , proposeMutationEnrichedH
+  , proposeMutationSemanticH
+  , proposeChangeSetH
   , scoreMutationsH
   ) where
 
 import Data.Text (Text)
 
 import DGM.HsAST (HsMutation)
-import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, proposeMutationEnriched, scoreAndRankMutations)
+import DGM.Oracle (OracleEnv, MutationContext, proposeMutation, proposeMutationEnriched, proposeMutationSemantic, proposeChangeSet, scoreAndRankMutations)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Capability token
@@ -109,6 +111,28 @@ proposeMutationEnrichedH
   -> FilePath -> Text -> Text   -- ^ file path, source, enriched prompt
   -> IO (Either Text HsMutation)
 proposeMutationEnrichedH (OracleHandle_ env) = proposeMutationEnriched env
+
+-- | Propose a mutation using a semantic (engineer-grade) prompt.
+--
+-- Like 'proposeMutationH' but takes a pre-built semantic prompt that
+-- includes type signatures, complexity metrics, test coverage, and
+-- failure history.
+proposeMutationSemanticH
+  :: OracleHandle
+  -> FilePath -> Text -> Text   -- ^ file path, source, semantic prompt
+  -> IO (Either Text HsMutation)
+proposeMutationSemanticH (OracleHandle_ env) = proposeMutationSemantic env
+
+-- | Propose a coordinated change set across multiple related files.
+--
+-- Like 'proposeMutationSemanticH' but for multi-file mutations.  The
+-- combined prompt contains semantic contexts for all files in the group;
+-- the Oracle returns per-file diffs.
+proposeChangeSetH
+  :: OracleHandle
+  -> Text                          -- ^ Combined multi-file prompt
+  -> IO (Either Text [(FilePath, HsMutation)])
+proposeChangeSetH (OracleHandle_ env) = proposeChangeSet env
 
 scoreMutationsH
   :: OracleHandle
