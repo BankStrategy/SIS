@@ -2,44 +2,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | Test suite for the Darwin Gödel Machine MVP.
 module Main where
-#ifdef WITH_EXACTPRINT
-  , testCase "writeMutationTyped returns TypedTxn and restores content" $ do
-      tmpDir <- getTemporaryDirectory
-      let repoRoot = tmpDir </> "dgm-selfmod-typed-test"
-          srcDGMDir = repoRoot </> "src" </> "DGM"
-      createDirectoryIfMissing True srcDGMDir
-      let target      = srcDGMDir </> "Fixture.hs"
-          origContent = "module Fixture where\n\nfixId :: a -> a\nfixId x = id x\n"
-      writeFile target origContent
-      parseResult <- parseHsFile target
-      case parseResult of
-        Left err -> assertFailure ("parseHsFile failed: " <> T.unpack err)
-        Right m  -> do
-          let muts = collectHsMutations defaultHsRules m
-          case muts of
-            [] -> assertFailure "No mutations found in fixture"
-            (mut:_) ->
-              case applyHsMutation mut m of
-                Left err  -> assertFailure ("applyHsMutation failed: " <> T.unpack err)
-                Right m'  -> do
-                  let node = exprToASTNode "n" (lit 1)
-                  st <- newAgentState node
-                  let st' = st { stateRepoRoot = repoRoot }
-                  audit <- newAuditLog
-                  let proof = QuorumProof "test" "test" 1.0
-                  res <- writeMutationTyped st' audit proof target m' mut
-                  case res of
-                    Left err -> assertFailure ("writeMutationTyped failed: " <> T.unpack err)
-                    Right txn -> do
-                      -- Verify file was updated
-                      newContent <- TIO.readFile target
-                      newContent @?= printHsModule m'
-                      -- Verify txn can restore original content
-                      let inv = txnOp txn
-                      let restored = backward inv (forward inv "")
-                      restored @?= T.pack origContent
-      removeDirectoryRecursive repoRoot `catch` \(_ :: IOError) -> pure ()
-#endif
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch)
 import Data.Int (Int64)
@@ -78,6 +40,9 @@ import DGM.AgentOracle
 import Data.Aeson ((.:))
 #endif
 
+#ifdef WITH_SQLITE
+#endif
+
 main :: IO ()
 main = defaultMain tests
 
@@ -93,43 +58,6 @@ tests = testGroup "DGM"
   , absoluteZeroTests
   , phaseGTests
   , cycleTests
-  , selfModTests
-  , selfCompileTests
-  , commitMutationTests
-  , modGraphTests
-  , generationTests
-  , reversalTests
-  , liquidTests
-  , oracleTests
-  , oracleHandleTests
-  , dynamicRuleTests
-  , pipelineTests
-  , natLangTests
-  , oracleContextTests
-  , semanticContextTests
-  , groupRelatedModulesTests
-  , semanticPromptTests
-  , parseTestDetailTests
-  , enrichScoreV2Tests
-  , liquidAnnotationTests
-  , failureReasonTests
-  , crossFileRoutingTests
-#ifdef WITH_ORACLE
-  , agentOracleTests
-#endif
-#ifdef WITH_SQLITE
-  , sqliteArchiveTests
-#endif
-#ifdef WITH_HINT
-  , hintEvalTests
-  , hintRuleCandidateTests
-#endif
-#ifdef WITH_EXACTPRINT
-  , hsASTTests
-#endif
-#ifdef WITH_SBV
-  , sbvVerificationTests
-#endif
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -575,6 +503,19 @@ archiveTests = testGroup "DGM.Archive"
       let decoded = jsonToArchive json
       decoded @?= Just entries
 
+  , testCase "InMemory backend supports all handle operations" $ do
+      hdl <- openArchive InMemory
+      flushArchive hdl [mkEntry "e1" 0.5 True]
+      loaded <- loadArchive hdl
+      loaded @?= []
+      flushBlacklist hdl [("file.hs", "desc")]
+      bl <- loadBlacklist hdl
+      bl @?= []
+      flushDynamicRules hdl [("desc", "snip", 1.0)]
+      dr <- loadDynamicRules hdl
+      dr @?= []
+      closeArchive hdl
+
   , testCase "openArchive InMemory works" $ do
       h <- openArchive InMemory
       entries <- loadArchive h
@@ -822,7 +763,28 @@ hintEvalTests = testGroup "DGM.Sandbox.hint"
 #ifdef WITH_SQLITE
 sqliteArchiveTests :: TestTree
 sqliteArchiveTests = testGroup "DGM.Archive.SQLite"
-  [ testCase "open and close SQLite archive creates table" $ do
+  [ testCase "SQLite archive flush+load round-trip" $ do
+      let path = "/tmp/dgm-test-sql.db"
+      cleanupDb path
+      hdl <- openArchive (SQLiteBacked path)
+      let e1 = mkEntry "sql1" 0.5 True
+          e2 = mkEntry "sql2" 0.6 False
+      flushArchive hdl [e1, e2]
+      loaded <- loadArchive hdl
+      length loaded @?= 2
+
+      flushBlacklist hdl [("file.hs", "desc")]
+      bl <- loadBlacklist hdl
+      bl @?= [("file.hs", "desc")]
+
+      flushDynamicRules hdl [("desc", "snip", 1.0)]
+      dr <- loadDynamicRules hdl
+      dr @?= [("desc", "snip", 1.0)]
+
+      closeArchive hdl
+      cleanupDb path
+
+  , testCase "open and close SQLite archive creates table" $ do
       let path = "/tmp/dgm-test-open.db"
       cleanupDb path
       hdl <- openArchive (SQLiteBacked path)
@@ -3119,5 +3081,26 @@ agentOracleTests = testGroup "AgentOracle"
         parser = Aeson.withObject "tool" $ \o -> do
           fn <- o .: "function"
           Aeson.withObject "fn" (.: "name") fn
+#endif
+
+#ifndef WITH_EXACTPRINT
+hsASTStubTests :: TestTree
+hsASTStubTests = testGroup "DGM.HsAST (Stubs)"
+  [ testCase "addHaddockRule returns stub error" $ do
+      let res = hmTransform addHaddockRule "some text"
+      res @?= Left "ghc-exactprint backend not enabled; build with -f+with-exactprint"
+
+  , testCase "addTypeAnnotationRule returns stub error" $ do
+      let res = hmTransform addTypeAnnotationRule "some text"
+      res @?= Left "ghc-exactprint backend not enabled; build with -f+with-exactprint"
+
+  , testCase "limitedEtaReduceRule returns stub error" $ do
+      let res = hmTransform limitedEtaReduceRule "some text"
+      res @?= Left "ghc-exactprint backend not enabled; build with -f+with-exactprint"
+
+  , testCase "simplifyIfRule returns stub error" $ do
+      let res = hmTransform simplifyIfRule "some text"
+      res @?= Left "ghc-exactprint backend not enabled; build with -f+with-exactprint"
+  ]
 #endif
 

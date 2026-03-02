@@ -324,7 +324,7 @@ runSelfModCycle cfg = do
         ((_, mut, _) : _)
           | "oracle-diff: " `T.isPrefixOf` hmDescription mut ->
               ( "oracle proposed: " <> T.take 40 (T.drop 13 (hmDescription mut))
-              , Just "google/gemini-3-flash-preview" )
+              , Just "google/gemini-3.1-pro-preview" )
           | otherwise ->
               ( "heuristic: " <> T.take 40 (hmDescription mut)
               , Nothing )

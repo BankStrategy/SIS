@@ -44,6 +44,7 @@ import DGM.HsAST (HsMutation(..))
 
 #ifdef WITH_ORACLE
 import Control.Exception (SomeException, try, catch, finally)
+import Control.Monad (when)
 import Data.Aeson ((.:), (.:?), (.=))
 import qualified Data.Aeson.Types as Aeson (parseEither, Parser)
 import qualified Data.Aeson.Key as AK
@@ -97,10 +98,18 @@ data ToolCallFunction = ToolCallFunction
   } deriving (Show, Eq)
 
 -- | Parsed response from OpenRouter.
+--
+-- The 'AgentToolCalls' constructor carries the /raw/ assistant message JSON
+-- from the API response.  This is critical for Gemini 3.x models which
+-- require @extra_content.google.thought_signature@ and @reasoning_details@
+-- to be echoed back verbatim on subsequent turns.
 data AgentResponse
-  = AgentToolCalls Text [ToolCall]   -- ^ Assistant content + tool calls.
-  | AgentFinalContent Text           -- ^ Final text content (no tool calls).
-  | AgentStopNoContent               -- ^ LLM stopped without content or tool calls.
+  = AgentToolCalls Aeson.Value [ToolCall]
+    -- ^ Raw assistant message JSON (for conversation replay) + parsed tool calls.
+  | AgentFinalContent Text
+    -- ^ Final text content (no tool calls).
+  | AgentStopNoContent
+    -- ^ LLM stopped without content or tool calls.
   deriving (Show, Eq)
 
 -- | Type alias for the diff parser (passed in to avoid circular imports).
@@ -133,9 +142,9 @@ parseToolCallJSON = Aeson.withObject "ToolCall" $ \o -> do
 
 parseAgentResponse :: LBS.ByteString -> Either Text AgentResponse
 parseAgentResponse body = case Aeson.decode body of
-  Nothing  -> Left "agent: JSON decode failed"
+  Nothing  -> Left ("agent: JSON decode failed, body: " <> T.take 500 (T.pack (show (LBS.take 500 body))))
   Just val -> case Aeson.parseEither parseResp val of
-    Left err  -> Left (T.pack err)
+    Left err  -> Left (T.pack err <> " | body: " <> T.take 2000 (T.pack (show (LBS.take 2000 body))))
     Right res -> Right res
   where
     parseResp = Aeson.withObject "Response" $ \o -> do
@@ -144,13 +153,17 @@ parseAgentResponse body = case Aeson.decode body of
         [] -> fail "agent: empty choices"
         (c:_) -> Aeson.withObject "Choice" (\ch -> do
           msg <- ch .: "message"
+          -- Parse the message for tool calls / content, but keep the raw
+          -- JSON ('msg') for verbatim replay.  Gemini 3.x models embed
+          -- thought_signature and reasoning_details in the message that
+          -- MUST be echoed back on subsequent turns.
           Aeson.withObject "Message" (\m -> do
             mContent   <- m .:? "content"
             mToolCalls <- m .:? "tool_calls"
             case (mToolCalls :: Maybe [Aeson.Value]) of
               Just tcs | not (null tcs) -> do
                 parsed <- mapM parseToolCallJSON tcs
-                return $ AgentToolCalls (maybe "" id mContent) parsed
+                return $ AgentToolCalls msg parsed
               _ -> case mContent of
                 Just txt | not (T.null (T.strip txt)) ->
                   return $ AgentFinalContent txt
@@ -355,15 +368,17 @@ runAgentOracle cfg diffParser targetFp src semanticPrompt = do
             Right (AgentFinalContent txt) -> do
               hPutStrLn stderr $ "[agent] final content (" ++ show (T.length txt) ++ " chars), session done"
               return (Right (mkResult ls))
-            Right (AgentToolCalls assistantContent toolCalls) -> do
+            Right (AgentToolCalls rawAssistantMsg toolCalls) -> do
               -- Check if agent called finish
               case findFinish toolCalls of
                 Just summary -> do
                   hPutStrLn stderr $ "[agent] finish called: " ++ T.unpack (T.take 100 summary)
                   return (Right (mkResult ls))
                 Nothing -> do
-                  let assistantMsg = mkAssistantMessage assistantContent toolCalls
-                      ls' = ls { lsMessages = lsMessages ls ++ [assistantMsg] }
+                  -- Use the RAW assistant message JSON for conversation replay.
+                  -- This preserves thought_signature and reasoning_details that
+                  -- Gemini 3.x models require to be echoed back verbatim.
+                  let ls' = ls { lsMessages = lsMessages ls ++ [rawAssistantMsg] }
                   -- Execute all tool calls
                   (toolResults, ls'') <- executeToolCalls targetFp diffParser toolCalls ls'
                   let ls''' = ls'' { lsMessages = lsMessages ls'' ++ toolResults
@@ -718,6 +733,7 @@ callOpenRouter cfg messages = do
         [ "model"       .= acModel cfg
         , "temperature" .= (0.4 :: Double)
         , "max_tokens"  .= (4096 :: Int)
+        , "stream"      .= False      -- Disable SSE; more reliable for tool calling
         , "tools"       .= agentTools
         , "messages"    .= messages
         ]
@@ -734,23 +750,11 @@ callOpenRouter cfg messages = do
                  :: IO (Either SomeException (HTTP.Response LBS.ByteString))
       case eResp of
         Left err   -> return (Left ("agent: HTTP error: " <> T.pack (show err)))
-        Right resp -> return (parseAgentResponse (HTTP.getResponseBody resp))
-
--- | Build the assistant message with tool calls for the conversation history.
-mkAssistantMessage :: Text -> [ToolCall] -> Aeson.Value
-mkAssistantMessage content tcs = Aeson.object $
-  [ "role" .= ("assistant" :: Text) ] ++
-  (if T.null content then [] else ["content" .= content]) ++
-  [ "tool_calls" .= map tcToJson tcs ]
-  where
-    tcToJson tc = Aeson.object
-      [ "id"       .= tcId tc
-      , "type"     .= ("function" :: Text)
-      , "function" .= Aeson.object
-        [ "name"      .= tcfName (tcFunction tc)
-        , "arguments" .= tcfArguments (tcFunction tc)
-        ]
-      ]
+        Right resp -> do
+          let status = HTTP.getResponseStatusCode resp
+          when (status /= 200) $
+            hPutStrLn stderr $ "[agent] HTTP " ++ show status ++ " response"
+          return (parseAgentResponse (HTTP.getResponseBody resp))
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Formatting helpers
