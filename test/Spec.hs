@@ -47,7 +47,7 @@ main :: IO ()
 main = defaultMain tests
 
 tests :: TestTree
-tests = testGroup "DGM"
+tests = testGroup "DGM" $
   [ typesTests
   , astTests
   , rewritingTests
@@ -59,6 +59,9 @@ tests = testGroup "DGM"
   , phaseGTests
   , cycleTests
   ]
+#ifdef WITH_SQLITE
+  ++ [sqliteArchiveTests]
+#endif
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- AST tests
