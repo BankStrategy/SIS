@@ -97,6 +97,7 @@ library
     , DGM.Reversal
     , DGM.Liquid
     , DGM.Oracle
+    , DGM.AgentOracle
     , DGM.OracleHandle
     , DGM.OracleContext
     , DGM.NatLang
@@ -248,4 +249,5 @@ test-suite dgm-test
   if flag(with-liquid)
     cpp-options: -DWITH_LIQUID
   if flag(with-oracle)
+    build-depends: aeson >= 2.0
     cpp-options: -DWITH_ORACLE

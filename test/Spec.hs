@@ -2,7 +2,44 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | Test suite for the Darwin Gödel Machine MVP.
 module Main where
-
+#ifdef WITH_EXACTPRINT
+  , testCase "writeMutationTyped returns TypedTxn and restores content" $ do
+      tmpDir <- getTemporaryDirectory
+      let repoRoot = tmpDir </> "dgm-selfmod-typed-test"
+          srcDGMDir = repoRoot </> "src" </> "DGM"
+      createDirectoryIfMissing True srcDGMDir
+      let target      = srcDGMDir </> "Fixture.hs"
+          origContent = "module Fixture where\n\nfixId :: a -> a\nfixId x = id x\n"
+      writeFile target origContent
+      parseResult <- parseHsFile target
+      case parseResult of
+        Left err -> assertFailure ("parseHsFile failed: " <> T.unpack err)
+        Right m  -> do
+          let muts = collectHsMutations defaultHsRules m
+          case muts of
+            [] -> assertFailure "No mutations found in fixture"
+            (mut:_) ->
+              case applyHsMutation mut m of
+                Left err  -> assertFailure ("applyHsMutation failed: " <> T.unpack err)
+                Right m'  -> do
+                  let node = exprToASTNode "n" (lit 1)
+                  st <- newAgentState node
+                  let st' = st { stateRepoRoot = repoRoot }
+                  audit <- newAuditLog
+                  let proof = QuorumProof "test" "test" 1.0
+                  res <- writeMutationTyped st' audit proof target m' mut
+                  case res of
+                    Left err -> assertFailure ("writeMutationTyped failed: " <> T.unpack err)
+                    Right txn -> do
+                      -- Verify file was updated
+                      newContent <- TIO.readFile target
+                      newContent @?= printHsModule m'
+                      -- Verify txn can restore original content
+                      let inv = txnOp txn
+                      let restored = backward inv (forward inv "")
+                      restored @?= T.pack origContent
+      removeDirectoryRecursive repoRoot `catch` \(_ :: IOError) -> pure ()
+#endif
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch)
 import Data.Int (Int64)
@@ -31,12 +68,23 @@ import DGM.Liquid (LiquidResult(..), parseLiquidOutput, verifyWithLiquid, hasLiq
 import DGM.OracleContext (GhcWarning(..), WarningKind(..), ModuleContext(..), parseGhcWarnings, buildModuleContext, buildEnrichedPrompt, buildSemanticPrompt)
 import DGM.SemanticContext (SemanticContext(..), FunctionInfo(..), TestMapping(..), extractFunctions, buildTestCoverage)
 
+#ifdef WITH_ORACLE
+import DGM.AgentOracle (agentTools, AgentConfig(..), AgentResult(..))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson (parseMaybe, withObject, parseEither)
+import DGM.AgentOracle
+  ( ToolCall(..), ToolCallFunction(..), AgentResponse(..)
+  , parseAgentResponse, parseToolArgs, mkTool )
+import Data.Aeson ((.:))
+#endif
+
 main :: IO ()
 main = defaultMain tests
 
 tests :: TestTree
 tests = testGroup "DGM"
-  [ astTests
+  [ typesTests
+  , astTests
   , rewritingTests
   , verificationTests
   , safetyKernelTests
@@ -66,6 +114,9 @@ tests = testGroup "DGM"
   , liquidAnnotationTests
   , failureReasonTests
   , crossFileRoutingTests
+#ifdef WITH_ORACLE
+  , agentOracleTests
+#endif
 #ifdef WITH_SQLITE
   , sqliteArchiveTests
 #endif
@@ -79,6 +130,19 @@ tests = testGroup "DGM"
 #ifdef WITH_SBV
   , sbvVerificationTests
 #endif
+
+  , testCase "findGitRoot finds root from subdirectory" $
+      withTempGitRepo $ \repoDir fp -> do
+        let subDir = takeDirectory fp
+        mRoot <- findGitRoot subDir
+        mRoot @?= Just repoDir
+
+  , testCase "gitRevParseHead returns a hash" $
+      withTempGitRepo $ \repoDir _ -> do
+        res <- gitRevParseHead repoDir
+        case res of
+          Left err -> assertFailure ("gitRevParseHead failed: " <> T.unpack err)
+          Right h  -> T.length h @?= 40
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +196,31 @@ astTests = testGroup "DGM.AST"
   ]
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Rewriting tests
+-- Types tests
+-- ─────────────────────────────────────────────────────────────────────────────
+
+typesTests :: TestTree
+typesTests = testGroup "DGM.Types"
+  [ testCase "initialMetrics has all zeros" $ do
+      let m = initialMetrics
+      totalIterations m @?= 0
+      successfulMutations m @?= 0
+      failedMutations m @?= 0
+      totalTasksSolved m @?= 0
+      verificationsPassed m @?= 0
+      verificationsFailed m @?= 0
+
+  , testCase "newAgentState initializes correctly" $ do
+      let bootstrap = exprToASTNode "test" bootstrapExpr
+      state <- newAgentState bootstrap
+      gen <- readTVarIO (stateGeneration state)
+      ast <- readTVarIO (stateCurrentAST state)
+      let root = stateRepoRoot state
+      gen @?= 0
+      astId ast @?= astId bootstrap
+      root @?= ""
+  ]
+
 -- ─────────────────────────────────────────────────────────────────────────────
 
 rewritingTests :: TestTree
@@ -456,6 +544,69 @@ archiveTests = testGroup "DGM.Archive"
       entries <- atomically $ getAll archVar
       -- Crucially, the failed entry must be in the archive.
       length (filter (not . entryPassed) entries) @?= 1
+
+  , testCase "sampleWeighted returns Nothing for empty archive" $ do
+      archVar <- newTVarIO []
+      res <- sampleWeighted archVar
+      res @?= Nothing
+
+  , testCase "sampleWeighted returns an entry for non-empty archive" $ do
+      archVar <- newTVarIO []
+      atomically $ addEntry archVar (mkEntry "e1" 0.5 True)
+      res <- sampleWeighted archVar
+      fmap entryId res @?= Just "e1"
+
+  , testCase "getLineage retrieves full chain" $ do
+      archVar <- newTVarIO []
+      let e1 = mkEntry "e1" 0.1 True
+      let e2 = (mkEntry "e2" 0.2 True) { entryParentId = Just "e1" }
+      let e3 = (mkEntry "e3" 0.3 True) { entryParentId = Just "e2" }
+      atomically $ do
+        addEntry archVar e1
+        addEntry archVar e2
+        addEntry archVar e3
+      chain <- atomically $ getLineage archVar "e3"
+      map entryId chain @?= ["e1", "e2", "e3"]
+
+  , testCase "getRecentFailures filters by file and status" $ do
+      archVar <- newTVarIO []
+      let mut1 = Mutation Optimize "file1.hs" (HaskellMutation "mut1")
+      let mut2 = Mutation Optimize "file2.hs" (HaskellMutation "mut2")
+      let e1 = (mkEntry "e1" 0.0 False) { entryMutation = Just mut1, entryFailureReason = Just "fail1" }
+      let e2 = (mkEntry "e2" 0.0 False) { entryMutation = Just mut2, entryFailureReason = Just "fail2" }
+      let e3 = (mkEntry "e3" 0.8 True)  { entryMutation = Just mut1 }
+      atomically $ do
+        addEntry archVar e1
+        addEntry archVar e2
+        addEntry archVar e3
+      fails <- atomically $ getRecentFailures archVar "file1.hs"
+      fails @?= [("placeholder", "fail1")]
+
+  , testCase "archiveToJSON and jsonToArchive round-trip" $ do
+      let entries = [mkEntry "e1" 0.5 True, mkEntry "e2" 0.7 False]
+      let json = archiveToJSON entries
+      let decoded = jsonToArchive json
+      decoded @?= Just entries
+
+  , testCase "openArchive InMemory works" $ do
+      h <- openArchive InMemory
+      entries <- loadArchive h
+      entries @?= []
+      flushArchive h [mkEntry "e1" 0.5 True]
+      closeArchive h
+
+  , testCase "blacklist operations in memory" $ do
+      h <- openArchive InMemory
+      flushBlacklist h [("file.hs", "bad mutation")]
+      bl <- loadBlacklist h
+      bl @?= [] -- InMemory is no-op for blacklist too
+
+  , testCase "dynamic rules operations in memory" $ do
+      h <- openArchive InMemory
+      flushDynamicRules h [("desc", "snippet", 0.9)]
+      rules <- loadDynamicRules h
+      rules @?= [] -- InMemory is no-op
+
   ]
 
 mkEntry :: Text -> Double -> Bool -> ArchiveEntry
@@ -842,7 +993,32 @@ hsASTTests = testGroup "DGM.HsAST"
 
   -- ── limitedEtaReduceRule ───────────────────────────────────────────────────
 
-  , testCase "limitedEtaReduceTransform reduces f x = g x" $ do
+  , testCase "etaReduceTransform reduces f x = g x" $ do
+      let src = "module Foo where\n\nfoo x = bar x\n"
+      case etaReduceTransform src of
+        Left err  -> assertFailure ("should have found eta candidate: " <> T.unpack err)
+        Right out -> T.isInfixOf "foo = bar" out @?= True
+
+  , testCase "etaReduceTransform reduces f x y = g x y to f x = g x" $ do
+      let src = "module Foo where\n\nfoo x y = bar x y\n"
+      case etaReduceTransform src of
+        Left err  -> assertFailure ("should have found eta candidate: " <> T.unpack err)
+        Right out -> T.isInfixOf "foo x = bar x" out @?= True
+
+  , testCase "mkTextModule creates a module that can be printed" $ do
+      let src = "module Foo where\nfoo = 42\n"
+      let m = mkTextModule (T.pack src)
+      printHsModule m @?= T.pack src
+
+  , testCase "hsNodeText returns the identifier of a node" $ do
+      let node = HsNode { hnText = "myFunc", hnKind = "value", hnLine = 10 }
+      hsNodeText node @?= "myFunc"
+
+  , testCase "defaultHsRules is non-empty" $ do
+      -- defaultHsRules should contain at least one rule (unusedImportRule, etc.)
+      -- even if exactprint is disabled, though the transforms might be stubs.
+      assertBool "defaultHsRules should not be empty" (not (null defaultHsRules))
+
       let src = "module Foo where\n\nfoo x = bar x\n"
       case limitedEtaReduceTransform src of
         Left err  -> assertFailure ("should have found eta candidate: " <> T.unpack err)
@@ -879,6 +1055,56 @@ hsASTTests = testGroup "DGM.HsAST"
         Right _ -> assertFailure "should not fire on non-constant condition"
 
   -- ── unusedImportRule correctness ───────────────────────────────────────────
+  -- ── unusedImportRule (unusedImportTransform) ──────────────────────────────
+
+  , testCase "unusedImportTransform removes unused explicit import" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , "import Data.List (sort, nub)"
+            , "foo = nub [1,2,1]"
+            ]
+      case unusedImportTransform src of
+        Left err -> assertFailure ("should have removed sort: " <> T.unpack err)
+        Right out -> do
+          T.isInfixOf "nub" out @?= True
+          T.isInfixOf "sort" out @?= False
+
+  , testCase "unusedImportTransform removes entire line if all names unused" $ do
+      let src = T.unlines
+            [ "module Foo where"
+            , "import Data.List (sort)"
+            , "foo = 42"
+            ]
+      case unusedImportTransform src of
+        Left err -> assertFailure ("should have removed line: " <> T.unpack err)
+        Right out -> T.isInfixOf "import Data.List" out @?= False
+
+  -- ── Shared helpers ────────────────────────────────────────────────────────
+
+  , testCase "splitAtBinding splits simple assignment" $ do
+      splitAtBinding "f x = g x" @?= Just ("f x ", " g x")
+
+  , testCase "splitAtBinding skips equality operator" $ do
+      splitAtBinding "f x = x == 1" @?= Just ("f x ", " x == 1")
+
+  , testCase "etaReduceRule description" $ do
+      hmDescription etaReduceRule @?= "eta-reduce: f x = g x \x2192 f = g"
+
+
+  , testCase "isIdentChar correctly identifies Haskell identifier characters" $ do
+      isIdentChar 'a' @?= True
+      isIdentChar '1' @?= True
+      isIdentChar '_' @?= True
+      isIdentChar '\'' @?= True
+      isIdentChar ' ' @?= False
+      isIdentChar '(' @?= False
+
+  , testCase "countWholeWord counts occurrences correctly" $ do
+      countWholeWord "foo" "foo bar foo" @?= 2
+      countWholeWord "foo" "foobar foo" @?= 1
+
+  , testCase "replaceWholeWord replaces occurrences correctly" $ do
+      replaceWholeWord "foo" "bar" "foo baz foo" @?= "bar baz foo"
 
   , testCase "unusedImportRule: whole-word matching (Map vs MapStrict)" $ do
       -- "Map" should NOT be flagged as unused when it appears as a whole word.
@@ -963,6 +1189,18 @@ selfModTests = testGroup "DGM.SelfMod"
   , testCase "proposeSelfMutations returns >= 1 candidate across DGM sources" $ do
       let node = exprToASTNode "n" (lit 1)
       st  <- newAgentState node
+  , testCase "readOwnSource parses a DGM file successfully" $ do
+      fps <- discoverSources
+      let selfMod = head $ filter (T.isSuffixOf "SelfMod.hs" . T.pack) fps
+      res <- readOwnSource selfMod
+      case res of
+        Left err -> assertFailure ("readOwnSource failed: " <> T.unpack err)
+        Right _  -> pure ()
+
+  , testCase "isDGMPath correctly identifies DGM paths" $ do
+      isDGMPath "src/DGM/SelfMod.hs" @?= True
+      isDGMPath "src/Other/File.hs" @?= False
+
       fps <- discoverSources
       candidates <- proposeSelfMutations st fps Nothing
       length candidates >= 1 @?= True
@@ -1200,6 +1438,19 @@ commitMutationTests = testGroup "DGM.SelfMod.commitMutation"
           msg   = commitMessage "src/DGM/Foo.hs" mut entry
       T.length msg @?= 72
   ]
+
+  , testCase "findGitRoot finds root from subdirectory" $
+      withTempGitRepo $ \repoDir fp -> do
+        let subDir = takeDirectory fp
+        mRoot <- findGitRoot subDir
+        mRoot @?= Just repoDir
+
+  , testCase "gitRevParseHead returns a hash" $
+      withTempGitRepo $ \repoDir _ -> do
+        res <- gitRevParseHead repoDir
+        case res of
+          Left err -> assertFailure ("gitRevParseHead failed: " <> T.unpack err)
+          Right h  -> T.length h @?= 40
 
 -- | Create a temporary git repository with one initial DGM source file.
 --
@@ -2815,3 +3066,84 @@ crossFileRoutingTests = testGroup "Cross-file routing"
         Left _  -> return ()
         Right _ -> assertFailure "Expected Left for app/ path"
   ]
+
+#ifdef WITH_ORACLE
+-- ─────────────────────────────────────────────────────────────────────────────
+-- AgentOracle tests
+-- ─────────────────────────────────────────────────────────────────────────────
+
+agentOracleTests :: TestTree
+agentOracleTests = testGroup "AgentOracle"
+  [ testCase "agentTools has 10 tool definitions" $
+      length agentTools @?= 10
+
+  , testCase "agentTools JSON round-trips" $ do
+      let encoded = Aeson.encode agentTools
+      case Aeson.decode encoded :: Maybe [Aeson.Value] of
+        Nothing  -> assertFailure "agentTools failed to round-trip"
+        Just lst -> length lst @?= 10
+
+  , testCase "agentTools contains read_file" $ do
+      let names = extractToolNames agentTools
+      assertBool "read_file not found" ("read_file" `elem` names)
+
+  , testCase "agentTools contains submit_change" $ do
+      let names = extractToolNames agentTools
+      assertBool "submit_change not found" ("submit_change" `elem` names)
+
+  , testCase "agentTools contains try_change" $ do
+      let names = extractToolNames agentTools
+      assertBool "try_change not found" ("try_change" `elem` names)
+
+  , testCase "AgentConfig fields accessible" $ do
+      let cfg = AgentConfig "key" "model" "url"
+      acApiKey cfg @?= "key"
+      acModel cfg @?= "model"
+      acBaseUrl cfg @?= "url"
+
+  , testCase "AgentResult fields accessible" $ do
+      let ar = AgentResult 3 ["src/DGM/Foo.hs"] 7
+      arChangesApplied ar @?= 3
+      arModifiedFiles ar @?= ["src/DGM/Foo.hs"]
+      arTurnsUsed ar @?= 7
+
+  , testCase "parseAgentResponse handles final content" $ do
+      let body = "{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"Done.\"}}]}"
+          res = parseAgentResponse body
+      res @?= Right (AgentFinalContent "Done.")
+
+  , testCase "parseAgentResponse handles tool calls" $ do
+      let body = "{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"read_file\", \"arguments\": \"{\\\"path\\\": \\\"f.hs\\\"}\"}}]}}]}"
+          res = parseAgentResponse body
+      case res of
+        Right (AgentToolCalls _ [tc]) -> do
+          tcId tc @?= "c1"
+          tcfName (tcFunction tc) @?= "read_file"
+        _ -> assertFailure $ "Expected tool calls, got " ++ show res
+
+  , testCase "parseToolArgs parses valid JSON" $ do
+      let args = parseToolArgs "{\"path\": \"src/Main.hs\", \"start_line\": 10}"
+      case Map.lookup "path" args of
+        Just (Aeson.String p) -> p @?= "src/Main.hs"
+        _ -> assertFailure "Failed to parse path from tool args"
+
+  , testCase "mkTool generates correct structure" $ do
+      let tool = mkTool "test_tool" "desc" [("p1", "string", "d1", True)]
+          names = extractToolNames [tool]
+      assertBool "test_tool found" ("test_tool" `elem` names)
+      -- Check required field
+      let req = Aeson.parseMaybe (Aeson.withObject "t" $ \o -> (o .: "function") >>= (Aeson.withObject "f" (.: "parameters")) >>= (Aeson.withObject "p" (.: "required"))) tool
+      req @?= Just (["p1"] :: [T.Text])
+  ]
+  where
+    extractToolNames :: [Aeson.Value] -> [T.Text]
+    extractToolNames = concatMap extractName
+    extractName val = case Aeson.parseMaybe parser val of
+      Just n  -> [n]
+      Nothing -> []
+      where
+        parser = Aeson.withObject "tool" $ \o -> do
+          fn <- o .: "function"
+          Aeson.withObject "fn" (.: "name") fn
+#endif
+

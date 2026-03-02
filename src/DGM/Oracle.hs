@@ -70,6 +70,9 @@ import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Network.HTTP.Simple as HTTP
+import System.IO (hPutStrLn, stderr)
+
+import DGM.AgentOracle (runAgentOracle, AgentConfig(..), AgentResult(..))
 #endif
 
 -- | Context from the archive to guide the oracle toward high-value mutations.
@@ -383,7 +386,38 @@ proposeMutationSemantic
   :: OracleEnv
   -> FilePath -> Text -> Text   -- ^ file path, source, semantic prompt
   -> IO (Either Text (Maybe FilePath, HsMutation))
-proposeMutationSemantic env fp _src semanticPrompt = do
+proposeMutationSemantic env fp src semanticPrompt = do
+  -- Try agentic approach first (multi-turn tool-use)
+  let agentCfg = AgentConfig
+        { acApiKey  = oeApiKey env
+        , acModel   = oeModel env
+        , acBaseUrl = oeBaseUrl env
+        }
+  agentResult <- runAgentOracle agentCfg parseDiffResponseWithPath fp src semanticPrompt
+  case agentResult of
+    Right ar | arChangesApplied ar > 0 -> do
+      -- Agent applied changes directly to disk; read current state
+      let modifiedFp = case arModifiedFiles ar of
+            (f:_) -> f
+            []    -> fp
+      currentContent <- TIO.readFile modifiedFp
+      return (Right (Just modifiedFp, HsMutation
+        { hmDescription = "agent-oracle: "
+            <> T.pack (show (arChangesApplied ar)) <> " changes applied"
+        , hmTransform = \original ->
+            if original == currentContent
+              then Left "no change"
+              else Right currentContent
+        }))
+    _ -> do
+      -- Fall back to single-shot (current behavior)
+      hPutStrLn stderr "[agent] falling back to single-shot semantic oracle"
+      proposeMutationSemanticSingleShot env semanticPrompt
+
+-- | Single-shot semantic mutation proposal (fallback from agentic approach).
+proposeMutationSemanticSingleShot
+  :: OracleEnv -> Text -> IO (Either Text (Maybe FilePath, HsMutation))
+proposeMutationSemanticSingleShot env semanticPrompt = do
   let url     = T.unpack (oeBaseUrl env) <> "/chat/completions"
       bodyLBS = encode $ object
                   [ "model"    .= oeModel env
